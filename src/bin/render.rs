@@ -131,15 +131,22 @@ struct Args {
     /// fit a memory budget; this forces streaming for huge uncapped datasets or byte-identity testing.
     #[arg(long, default_value_t = false)]
     no_parallel: bool,
-    /// Noise A1 — Gaussian m/z scatter on **precursor (MS1)** peaks, as a ppm standard deviation, applied
-    /// before m/z→tof so a search engine sees a realistic non-degenerate mass-error distribution to
-    /// calibrate against. `0` = off (byte-identical to the noiseless render). Seeded per
+    /// Noise A1 — m/z scatter on **precursor (MS1)** peaks, applied before m/z→tof so a search engine sees
+    /// a realistic non-degenerate mass-error distribution to calibrate against. The value is a **ppm
+    /// envelope**, matching v1's convention (`precursor_noise_ppm`, default 5.0): in the default Gaussian
+    /// mode the actual standard deviation is `mz·ppm/1e6/3` (ppm = 3σ), reproducing v1's
+    /// `add_mz_noise_normal`. `0` = off (byte-identical to the noiseless render). Seeded per
     /// `(precursor_id, peak_index)` so adding an ion never reshuffles the others. See `REALISM_PLAN.md`.
     #[arg(long, default_value_t = 0.0)]
     noise_mz_ppm: f64,
-    /// Noise A1 — Gaussian m/z scatter on **fragment (MS2)** peaks (ppm standard deviation). `0` = off.
+    /// Noise A1 — m/z scatter on **fragment (MS2)** peaks (ppm envelope, v1 `fragment_noise_ppm`). `0` = off.
     #[arg(long, default_value_t = 0.0)]
     noise_frag_ppm: f64,
+    /// Noise A1 — use **uniform** m/z scatter (v1 `mz_noise_uniform=true`): a symmetric `mz ± mz·ppm/1e6`
+    /// draw instead of the default Gaussian `add_mz_noise_normal`. Applies to both precursor and fragment
+    /// ppm. (v1's asymmetric `right_drag` tailing variant is not ported.)
+    #[arg(long, default_value_t = false)]
+    noise_mz_uniform: bool,
     /// Seed for the noise draws. Same seed + same inputs → identical render; change it to draw a different
     /// (still deterministic) mass-error realisation. Ignored when both noise ppm values are `0`.
     #[arg(long, default_value_t = 0)]
@@ -615,19 +622,38 @@ fn hash01(x: u64) -> f64 {
     (splitmix64(x) >> 11) as f64 / (1u64 << 53) as f64
 }
 
-/// Deterministic standard-normal draw (mean 0, sd 1) for peak `k` of precursor `pc`, via Box–Muller over
-/// two decorrelated uniform draws. Identity-keyed on `(pc, is_frag, k, seed)` so the noise realisation is
-/// reproducible and stable under `--limit` — adding or removing ions leaves every other draw unchanged.
-/// The fields are folded in through successive `splitmix64` avalanches (NOT a single linear sum), so no
-/// field's contribution can be algebraically cancelled by another: the MS1 vs MS2 peak streams (`is_frag`)
-/// and distinct `seed`s stay genuinely independent, not merely offset. Used by A1 m/z-ppm scatter.
+/// Identity-keyed RNG state for peak `k` of precursor `pc`. The fields are folded in through successive
+/// `splitmix64` avalanches (NOT a single linear sum), so no field's contribution can be algebraically
+/// cancelled by another: the MS1 vs MS2 peak streams (`is_frag`) and distinct `seed`s stay genuinely
+/// independent, not merely offset. Keying on `(pc, is_frag, k, seed)` — rather than on the frame/scan —
+/// makes the draw reproducible and stable under `--limit`: adding or removing ions leaves every other
+/// draw unchanged. This is a deliberate divergence from v1, which redraws m/z noise independently per
+/// scan; here a peak's scatter is a single offset coherent across its whole elution. The marginal
+/// mass-error distribution a search engine calibrates against is the same; only the within-elution
+/// correlation differs (v1: independent per scan; v2: constant per peak).
+fn noise_state(pc: u64, is_frag: bool, k: usize, seed: u64) -> u64 {
+    let z = splitmix64(seed ^ if is_frag { 0x9E37_79B9_7F4A_7C15 } else { 0 });
+    splitmix64(splitmix64(z ^ pc) ^ k as u64)
+}
+
+#[inline]
+fn to01(x: u64) -> f64 {
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Standard-normal draw (mean 0, sd 1) via Box–Muller over two decorrelated uniforms off `noise_state`.
+/// Reproduces the shape of v1's `add_mz_noise_normal`; the caller supplies the `ppm/3` scale.
 fn gauss_unit(pc: u64, is_frag: bool, k: usize, seed: u64) -> f64 {
-    let mut z = splitmix64(seed ^ if is_frag { 0x9E37_79B9_7F4A_7C15 } else { 0 });
-    z = splitmix64(z ^ pc);
-    z = splitmix64(z ^ k as u64);
-    let u1 = ((splitmix64(z) >> 11) as f64 / (1u64 << 53) as f64).max(1e-12); // clamp away from ln(0)
-    let u2 = (splitmix64(z ^ 0xD1B5_4A32_D192_ED03) >> 11) as f64 / (1u64 << 53) as f64;
+    let z = noise_state(pc, is_frag, k, seed);
+    let u1 = to01(splitmix64(z)).max(1e-12); // clamp away from ln(0)
+    let u2 = to01(splitmix64(z ^ 0xD1B5_4A32_D192_ED03));
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+/// Uniform draw on `[-1, 1)` off `noise_state`. Reproduces v1's symmetric `add_mz_noise_uniform`
+/// (`right_drag=false`); the caller supplies the `ppm` scale.
+fn uniform_unit(pc: u64, is_frag: bool, k: usize, seed: u64) -> f64 {
+    2.0 * to01(splitmix64(noise_state(pc, is_frag, k, seed) ^ 0x2545_F491_4F6C_DD1D)) - 1.0
 }
 
 /// The mobility scan for a precursor: physical CCS→1/K0 (Mason-Schamp) when its CCS is known, else a
@@ -937,15 +963,22 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
 
     // Project each precursor's spectra to tof and build DIA ions.
     let project = |pc: u64, is_frag: bool, peaks: &[(f64, f32)]| -> Vec<(u32, f32)> {
-        // A1 noise: Gaussian m/z scatter (ppm) applied per peak before m/z→tof. `ppm == 0` keeps `m`
-        // untouched, so the noiseless render stays byte-identical.
+        // A1 signal-m/z noise: per-peak m/z scatter applied before m/z→tof, matching v1's `add_mz_noise_*`.
+        // `ppm` is a 3σ envelope (v1 convention). `ppm == 0` keeps `m` untouched → byte-identical noiseless
+        // render. Gaussian (default): sd = mz·ppm/1e6/3 (v1 `add_mz_noise_normal`). Uniform: mz ± mz·ppm/1e6
+        // (v1 `add_mz_noise_uniform`, right_drag=false).
         let ppm = if is_frag { a.noise_frag_ppm } else { a.noise_mz_ppm };
         peaks
             .iter()
             .enumerate()
             .filter_map(|(k, &(m, inten))| {
                 let m = if ppm > 0.0 {
-                    m * (1.0 + gauss_unit(pc, is_frag, k, a.noise_seed) * ppm * 1e-6)
+                    let rel = if a.noise_mz_uniform {
+                        uniform_unit(pc, is_frag, k, a.noise_seed) * ppm * 1e-6
+                    } else {
+                        gauss_unit(pc, is_frag, k, a.noise_seed) * ppm * 1e-6 / 3.0
+                    };
+                    m * (1.0 + rel)
                 } else {
                     m
                 };
@@ -1430,4 +1463,47 @@ fn verify(dir: &std::path::Path, p: &Placement) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod noise_tests {
+    use super::{gauss_unit, uniform_unit, noise_state};
+
+    // gauss_unit must be ~N(0,1): the caller scales by ppm/3·1e-6 to reproduce v1's add_mz_noise_normal
+    // (sd = mz·ppm/1e6/3), so the unit draw carries the shape and this pins mean≈0, sd≈1.
+    #[test]
+    fn gauss_unit_is_standard_normal() {
+        let n = 400_000usize;
+        let (mut s, mut s2) = (0f64, 0f64);
+        for k in 0..n { let z = gauss_unit(12345, false, k, 7); s += z; s2 += z * z; }
+        let mean = s / n as f64;
+        let sd = (s2 / n as f64 - mean * mean).sqrt();
+        assert!(mean.abs() < 0.01, "mean {mean}");
+        assert!((sd - 1.0).abs() < 0.01, "sd {sd}");
+    }
+
+    // uniform_unit must be ~U(-1,1): caller scales by ppm·1e-6 to reproduce v1's symmetric
+    // add_mz_noise_uniform (mz ± mz·ppm/1e6). U(-1,1) has mean 0, sd 1/sqrt(3), and stays in [-1,1).
+    #[test]
+    fn uniform_unit_is_pm_one() {
+        let n = 400_000usize;
+        let (mut s, mut s2, mut mn, mut mx) = (0f64, 0f64, 1e9f64, -1e9f64);
+        for k in 0..n { let u = uniform_unit(9, true, k, 3); s += u; s2 += u * u; mn = mn.min(u); mx = mx.max(u); }
+        let mean = s / n as f64;
+        let sd = (s2 / n as f64 - mean * mean).sqrt();
+        assert!(mean.abs() < 0.01, "mean {mean}");
+        assert!((sd - (1.0f64 / 3.0).sqrt()).abs() < 0.01, "sd {sd}");
+        assert!(mn >= -1.0 && mx < 1.0, "range {mn}..{mx}");
+    }
+
+    // The is_frag salt genuinely separates the MS1 and MS2 peak streams (not merely offsets them):
+    // identical (pc,k,seed) must give decorrelated draws across the two streams.
+    #[test]
+    fn ms1_ms2_streams_are_independent() {
+        let mut collisions = 0;
+        for k in 0..2000 {
+            if noise_state(5, false, k, 1) == noise_state(5, true, k, 1) { collisions += 1; }
+        }
+        assert_eq!(collisions, 0, "MS1/MS2 key collisions: {collisions}");
+    }
 }
