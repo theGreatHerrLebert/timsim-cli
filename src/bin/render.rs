@@ -463,15 +463,46 @@ static SATURATION_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// bins whose scaled value exceeds `u32::MAX` would be silently clipped by the `as u32` saturating cast,
 /// so we detect that and warn ONCE — a saturated frame means `intensity_scale` is too hot for the most
 /// abundant ion and the dynamic range is being crushed at the top (calibrate the scale down).
+/// Dep-free FxHash-style hasher. The DIA sweep spends ~40% of the render in `dedup_and_quantise`, almost
+/// all of it SipHashing `(u32,u32)` keys (profiled). SipHash is DoS-resistant, which this hot inner loop
+/// does not need; an integer multiply-rotate is far cheaper. Byte-identity is unaffected: the per-key f64
+/// sum (accumulated in input-triple order) is unchanged, and `encode_frame_block` re-sorts to canonical
+/// block bytes — only the (already-non-canonical) HashMap drain order differs.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(K);
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+}
+type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
+
 fn dedup_and_quantise(triples: &[(u32, u32, f64)], scale: f64, floor: u32) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     debug_assert!(scale.is_finite() && scale > 0.0, "intensity_scale must be finite and > 0");
     const CEIL: f64 = u32::MAX as f64;
-    let mut summed: HashMap<(u32, u32), f64> = HashMap::with_capacity(triples.len());
+    // Pack (scan, tof) into a single u64 key so one cheap u64 hash replaces the tuple's two-field SipHash.
+    let mut summed: HashMap<u64, f64, FxBuild> =
+        HashMap::with_capacity_and_hasher(triples.len(), Default::default());
     for &(scan, tof, v) in triples {
-        *summed.entry((scan, tof)).or_insert(0.0) += v;
+        *summed.entry(((scan as u64) << 32) | tof as u64).or_insert(0.0) += v;
     }
     let (mut scans, mut tofs, mut ints) = (Vec::new(), Vec::new(), Vec::new());
-    for ((scan, tof), v) in summed {
+    for (key, v) in summed {
+        let (scan, tof) = ((key >> 32) as u32, key as u32);
         let scaled = v * scale;
         if scaled >= CEIL
             && !SATURATION_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
