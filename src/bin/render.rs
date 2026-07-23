@@ -126,6 +126,11 @@ struct Args {
     /// chunk-stitching (any N ≥ 1 must produce byte-identical output to N = 1).
     #[arg(long, default_value_t = 0)]
     render_chunks: u32,
+    /// DIA render: force the STREAMING single-threaded path (bounded to one chunk's ions), disabling the
+    /// resident multi-threaded fast path. The fast path is used by default when the ion set is estimated to
+    /// fit a memory budget; this forces streaming for huge uncapped datasets or byte-identity testing.
+    #[arg(long, default_value_t = false)]
+    no_parallel: bool,
     /// Render a DIA run: interleave MS1 + MS2 frames on the reference `.d`'s cycle, gate fragments by
     /// the diagonal quadrupole transmission. Requires `--reference-d` (a DIA `.d` for the schedule).
     #[arg(long, default_value_t = false)]
@@ -1053,6 +1058,118 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
     let mut with_ms2: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let gap_ms = |f: u32| if sched.ms_level(f) == 1 { 0u8 } else { 9u8 };
 
+    // Fast path (default when the ion set is estimated to fit): project all ions resident ONCE, then
+    // render fine frame-chunks in PARALLEL — each encodes its blocks with the pure `encode_frame_block`
+    // and they are appended in frame order, which ms-io guarantees is byte-identical to the serial
+    // `write_frame` loop. Gated on a memory estimate; `--no-parallel`, an explicit `--render-chunks`, or a
+    // dataset too big for the budget fall back to the streaming single-threaded path below (which keeps
+    // peak memory bounded to one chunk regardless of dataset size).
+    const RESIDENT_BUDGET: u64 = 6 * 1024 * 1024 * 1024; // ions + encoded blocks + overhead
+    let use_parallel = !a.no_parallel
+        && a.render_chunks == 0
+        && (meta.len() as u64) * (BYTES_PER_ION_EST as u64) < RESIDENT_BUDGET;
+
+    if use_parallel {
+        use rayon::prelude::*;
+        // 1) Build ALL DiaIons resident (one streaming pass). Project m/z->tof HERE, sequentially — the
+        //    projection closure captures the non-Sync `Placement`, so it must not cross the rayon boundary.
+        let mut builders: HashMap<u64, (bool, Vec<(u32, f32)>, Vec<(u32, f32)>)> =
+            HashMap::with_capacity(meta.len());
+        for b in timsim_schema::read_stream(&a.ion_spectra, SP::TABLE)? {
+            let b = b?;
+            let pcid: &UInt64Array = b.column_by_name(SP::PRECURSOR_ID).unwrap().as_any().downcast_ref().unwrap();
+            let level: &UInt8Array = b.column_by_name(SP::MS_LEVEL).unwrap().as_any().downcast_ref().unwrap();
+            let mz: &ListArray = b.column_by_name(SP::MZ).unwrap().as_any().downcast_ref().unwrap();
+            let inten: &ListArray = b.column_by_name(SP::INTENSITY).unwrap().as_any().downcast_ref().unwrap();
+            for i in 0..b.num_rows() {
+                let pc = pcid.value(i);
+                if !meta.contains_key(&pc) { continue; }
+                let mzv = mz.value(i); let mzv: &Float64Array = mzv.as_any().downcast_ref().unwrap();
+                let iv = inten.value(i); let iv: &Float32Array = iv.as_any().downcast_ref().unwrap();
+                let raw: Vec<(f64, f32)> = (0..mzv.len()).map(|k| (mzv.value(k), iv.value(k))).collect();
+                let proj = project(&raw);
+                let e = builders.entry(pc).or_insert((false, Vec::new(), Vec::new()));
+                match level.value(i) {
+                    1 => { e.0 = true; e.1 = proj; }
+                    2 => { if !proj.is_empty() { with_ms2.insert(pc); } e.2 = proj; }
+                    _ => {}
+                }
+            }
+        }
+        // Same keep rule + global-order sort as the serial path (so per-frame deposit order is identical).
+        let mut ions: Vec<(u32, DiaIon)> = builders.into_iter().filter_map(|(pc, (had, m1, m2))| {
+            if !had || (m1.is_empty() && m2.is_empty()) { return None; }
+            let m = meta.get(&pc)?;
+            Some((m.order, DiaIon {
+                apex_frame: m.apex_frame, scan_center: m.scan, abundance: m.abundance,
+                precursor_mz: m.precursor_mz, ms1_peaks: m1, ms2_peaks: m2, survival: m.survival,
+            }))
+        }).collect();
+        ions.sort_unstable_by_key(|x| x.0);
+        let ions: Vec<DiaIon> = ions.into_iter().map(|x| x.1).collect();
+
+        // 2) Fine frame-chunks (threads*8) at equal-ion quantiles, for load-balance + work-stealing.
+        let pn = ((rayon::current_num_threads() * 8) as u32).clamp(1, a.n_frames.max(1));
+        let pbounds: Vec<u32> = {
+            let mut starts: Vec<u32> = ions.iter().map(|io| active_frames(io.apex_frame, g).0).collect();
+            starts.sort_unstable();
+            let mut bnds = Vec::with_capacity(pn as usize + 1);
+            bnds.push(1u32);
+            for c in 1..pn {
+                let mut f = if starts.is_empty() { 1 + a.n_frames * c / pn }
+                    else { starts[(starts.len() * c as usize / pn as usize).min(starts.len() - 1)] };
+                let prev = *bnds.last().unwrap();
+                f = f.max(prev + 1).min(a.n_frames);
+                bnds.push(f);
+            }
+            bnds.push(a.n_frames + 1);
+            bnds
+        };
+        eprintln!("  resident parallel render: {} ions, {} frame-chunks on {} threads -> {}",
+            ions.len(), pn, rayon::current_num_threads(), a.out.display());
+
+        // 3) Render + encode each chunk in PARALLEL. The closure is pure: reads `ions`/`sched`/`g`, calls
+        //    the Sync `apply_transmission`, and emits owned EncodedBlocks. Gated memory bounds the collect.
+        type ChunkOut = (Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)>, u64, u64);
+        let (n_scans, iscale, floor) = (p.n_scans, a.intensity_scale, a.min_peak_intensity);
+        let chunks: Vec<Result<ChunkOut, String>> = (0..pn).into_par_iter().map(|c| {
+            let (fc0, fc1) = (pbounds[c as usize], pbounds[c as usize + 1] - 1);
+            if fc1 < fc0 { return Ok((Vec::new(), 0, 0)); }
+            // Ions active anywhere in [fc0, fc1] (inclusive overlap), preserving global order.
+            let subset: Vec<DiaIon> = ions.iter()
+                .filter(|io| { let (fs, fe) = active_frames(io.apex_frame, g); fe >= fc0 && fs <= fc1 })
+                .cloned().collect();
+            let (mut c1, mut c2) = (0u64, 0u64);
+            let mut out: Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)> = Vec::new();
+            let mut err: Option<String> = None;
+            dia_render_range(&subset, &sched, g, fc0, fc1, |frame, ms_type, tri| {
+                if err.is_some() { return; }
+                let (scans, tofs, ints) = dedup_and_quantise(tri, iscale, floor);
+                if ms_type == 0 { c1 += scans.len() as u64 } else { c2 += scans.len() as u64 }
+                match ms_io::data::tdf_writer::encode_frame_block(&scans, &tofs, &ints, n_scans, 1) {
+                    Ok(blk) => out.push((frame, ms_type, blk)),
+                    Err(e) => err = Some(e.to_string()),
+                }
+            });
+            match err { Some(e) => Err(e), None => Ok((out, c1, c2)) }
+        }).collect();
+
+        // 4) Append in frame order (chunks are frame-ordered), filling empty gap frames via `write_frame`
+        //    (identical to the serial empty-frame write). Sequential; append is ~0.02% of runtime.
+        for chunk in chunks {
+            let (blocks, c1, c2) = chunk.map_err(|e| anyhow!("{e}"))?;
+            ms1_peaks += c1; ms2_peaks += c2;
+            for (frame, ms_type, blk) in blocks {
+                while next_fid < frame {
+                    write_frame(&mut writer, next_fid, gap_ms(next_fid), a.cycle_seconds, Vec::new(), Vec::new(), Vec::new())?;
+                    next_fid += 1;
+                }
+                writer.append_encoded_frame(frame, frame as f64 * a.cycle_seconds, ms_type, blk)
+                    .map_err(|e| anyhow!("{e}"))?;
+                next_fid = frame + 1;
+            }
+        }
+    } else {
     for chunk in 0..n_chunks {
         let fc0 = bounds[chunk as usize];
         let fc1 = bounds[chunk as usize + 1] - 1;
@@ -1139,6 +1256,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             next_fid = frame + 1;
         });
         err?;
+    }
     }
     while next_fid <= a.n_frames {
         write_frame(&mut writer, next_fid, gap_ms(next_fid), a.cycle_seconds, Vec::new(), Vec::new(), Vec::new())?;
