@@ -148,6 +148,12 @@ struct Args {
     /// DDA: path for the sidecar answer key (Parquet). Default: `<out>.dda_selected.parquet`.
     #[arg(long)]
     dda_truth: Option<PathBuf>,
+    /// DIA: path for the per-precursor answer key (Parquet) — the same 8-column schema as the Thermo
+    /// render's `--thermo-truth` (precursor_id, peptide_id, charge, mz, rt_seconds, abundance, has_ms2,
+    /// in_any_window). Lets a DiaNN search of the `.d` be scored against the render's ground truth, the
+    /// way the Thermo path already closes search→score. Omit to skip the answer key.
+    #[arg(long)]
+    truth: Option<PathBuf>,
     /// After writing, reopen the `.d` through the rustims reader and report what round-trips.
     #[arg(long, default_value_t = false)]
     verify: bool,
@@ -885,6 +891,9 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         precursor_mz: f64,
         survival: f64,
         order: u32,
+        // Identity, carried through for the answer key (`--truth`) — the render itself doesn't need them.
+        peptide_id: u64,
+        charge: i64,
     }
     let mut meta: HashMap<u64, IonMeta> = HashMap::new();
     let mut order: u32 = 0;
@@ -913,7 +922,10 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 .unwrap_or(0.0);
             meta.insert(
                 pcid.value(i),
-                IonMeta { apex_frame, scan, abundance, precursor_mz: mz.value(i), survival, order },
+                IonMeta {
+                    apex_frame, scan, abundance, precursor_mz: mz.value(i), survival, order,
+                    peptide_id: pid.value(i), charge: chg.value(i).max(1) as i64,
+                },
             );
             order += 1;
             if a.limit > 0 && meta.len() >= a.limit {
@@ -984,6 +996,10 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
 
     let mut next_fid: u32 = 1;
     let (mut ms1_peaks, mut ms2_peaks) = (0u64, 0u64);
+    // Precursors that projected at least one in-range MS2 fragment — the `has_ms2` truth flag. Accumulated
+    // across chunks (a precursor active in several chunks projects the same fragments each time; a set
+    // dedups). Only meaningful when `--truth` is requested, but cheap to keep either way.
+    let mut with_ms2: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let gap_ms = |f: u32| if sched.ms_level(f) == 1 { 0u8 } else { 9u8 };
 
     for chunk in 0..n_chunks {
@@ -1018,7 +1034,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 let e = builders.entry(pc).or_insert((false, Vec::new(), Vec::new()));
                 match level.value(i) {
                     1 => { e.0 = true; e.1 = proj; }
-                    2 => { e.2 = proj; }
+                    2 => { if !proj.is_empty() { with_ms2.insert(pc); } e.2 = proj; }
                     _ => {}
                 }
             }
@@ -1079,6 +1095,57 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
     }
     writer.finalize().map_err(|e| anyhow!("{e}"))?;
     println!("  wrote {} frames ({} MS1 + {} MS2 peaks) -> {}", a.n_frames, ms1_peaks, ms2_peaks, a.out.display());
+
+    // Answer key: per-precursor DIA truth, the SAME 8-column schema render_thermo writes — so the eval
+    // harness scores a DiaNN search of this `.d` exactly as it does the Thermo `.raw`. rt_seconds mirrors
+    // run_dda (apex_frame × cycle_seconds, the render's own time axis); in_any_window flags whether the
+    // precursor m/z falls inside some inherited DIA isolation window (|mz − center| ≤ width/2, the point
+    // where the soft transmission edge crosses 0.5).
+    if let Some(truth) = &a.truth {
+        use arrow::array::{BooleanArray, Float64Array as F64, Int64Array, UInt64Array as U64};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+        // Distinct isolation windows (center, half-width) from the replayed schedule.
+        let mut half: Vec<(f64, f64)> = sched.windows.iter()
+            .map(|w| (w.isolation_mz, w.isolation_width * 0.5))
+            .collect();
+        half.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)));
+        half.dedup_by(|x, y| (x.0 - y.0).abs() < 1e-6 && (x.1 - y.1).abs() < 1e-6);
+        // File-order rows (by `order`) for a reproducible answer key, like render_thermo's `precs`.
+        let mut rows: Vec<(&u64, &IonMeta)> = meta.iter().collect();
+        rows.sort_unstable_by_key(|(_, m)| m.order);
+        let (mut pc, mut pe, mut ch, mut mo, mut rtc, mut ab, mut hm, mut iw):
+            (Vec<u64>, Vec<u64>, Vec<i64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<bool>, Vec<bool>) = Default::default();
+        for (&pcid, m) in &rows {
+            pc.push(pcid); pe.push(m.peptide_id); ch.push(m.charge);
+            mo.push(m.precursor_mz); rtc.push(m.apex_frame * a.cycle_seconds); ab.push(m.abundance);
+            hm.push(with_ms2.contains(&pcid));
+            iw.push(half.iter().any(|&(c, hw)| (m.precursor_mz - c).abs() <= hw));
+        }
+        let n = pc.len();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("precursor_id", DataType::UInt64, false),
+            Field::new("peptide_id", DataType::UInt64, false),
+            Field::new("charge", DataType::Int64, false),
+            Field::new("mz", DataType::Float64, false),
+            Field::new("rt_seconds", DataType::Float64, false),
+            Field::new("abundance", DataType::Float64, false),
+            Field::new("has_ms2", DataType::Boolean, false),
+            Field::new("in_any_window", DataType::Boolean, false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(U64::from(pc)), Arc::new(U64::from(pe)), Arc::new(Int64Array::from(ch)),
+            Arc::new(F64::from(mo)), Arc::new(F64::from(rtc)), Arc::new(F64::from(ab)),
+            Arc::new(BooleanArray::from(hm)), Arc::new(BooleanArray::from(iw)),
+        ])?;
+        let file = std::fs::File::create(truth)?;
+        let mut w = ArrowWriter::try_new(file, schema, None)?;
+        w.write(&batch)?; w.close()?;
+        println!("  answer key ({n} precursors) -> {}", truth.display());
+    }
+
     if a.verify {
         verify(&a.out, p)?;
     }
