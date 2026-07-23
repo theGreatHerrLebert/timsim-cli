@@ -1118,21 +1118,21 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
 
     // Answer key: per-precursor DIA truth, the SAME 8-column schema render_thermo writes — so the eval
     // harness scores a DiaNN search of this `.d` exactly as it does the Thermo `.raw`. rt_seconds mirrors
-    // run_dda (apex_frame × cycle_seconds, the render's own time axis); in_any_window flags whether the
-    // precursor m/z falls inside some inherited DIA isolation window (|mz − center| ≤ width/2, the point
-    // where the soft transmission edge crosses 0.5).
+    // run_dda (apex_frame × cycle_seconds, the render's own time axis).
+    //
+    // in_any_window is MOBILITY-AWARE here (the ion-mobility-correct denominator): in dia-PASEF the
+    // quadrupole samples a DIAGONAL — window W isolates m/z [center±width/2] only for the mobility scans
+    // [scan_begin, scan_end]. A precursor is truly isolatable (co-isolatable with its fragments) iff its
+    // m/z AND its placed mobility scan both fall in SOME window. The m/z-only test (used by the no-mobility
+    // Thermo/SCIEX writers) OVERCOUNTS on timsTOF: it flags precursors whose m/z is in a window but whose
+    // mobility is off the diagonal — never co-isolated, so uncountable in the denominator. Using the full
+    // (m/z, scan) window support makes Bruker recall comparable to the no-IMS instruments.
     if let Some(truth) = &a.truth {
         use arrow::array::{BooleanArray, Float64Array as F64, Int64Array, UInt64Array as U64};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use parquet::arrow::ArrowWriter;
         use std::sync::Arc;
-        // Distinct isolation windows (center, half-width) from the replayed schedule.
-        let mut half: Vec<(f64, f64)> = sched.windows.iter()
-            .map(|w| (w.isolation_mz, w.isolation_width * 0.5))
-            .collect();
-        half.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)));
-        half.dedup_by(|x, y| (x.0 - y.0).abs() < 1e-6 && (x.1 - y.1).abs() < 1e-6);
         // File-order rows (by `order`) for a reproducible answer key, like render_thermo's `precs`.
         let mut rows: Vec<(&u64, &IonMeta)> = meta.iter().collect();
         rows.sort_unstable_by_key(|(_, m)| m.order);
@@ -1142,7 +1142,11 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             pc.push(pcid); pe.push(m.peptide_id); ch.push(m.charge);
             mo.push(m.precursor_mz); rtc.push(m.apex_frame * a.cycle_seconds); ab.push(m.abundance);
             hm.push(with_ms2.contains(&pcid));
-            iw.push(half.iter().any(|&(c, hw)| (m.precursor_mz - c).abs() <= hw));
+            // Mobility-aware isolatability: some window covers this precursor in BOTH m/z and mobility scan.
+            iw.push(sched.windows.iter().any(|w|
+                (m.precursor_mz - w.isolation_mz).abs() <= w.isolation_width * 0.5
+                && m.scan >= w.scan_num_begin as f64
+                && m.scan <= w.scan_num_end as f64));
         }
         let n = pc.len();
         let schema = Arc::new(Schema::new(vec![
