@@ -69,7 +69,12 @@ struct Args {
     /// reference-free Simple calibration.
     #[arg(long)]
     reference_d: Option<PathBuf>,
-    #[arg(long, default_value_t = 3000, value_parser = clap::value_parser!(u32).range(1..))]
+    /// Number of frames = the run's LENGTH. `0` (default) INHERITS the reference `.d`'s own frame count
+    /// (so the render matches the reference gradient, not a fixed 5-min stub) — or 3000 with no reference.
+    /// Set a positive value to force a length (e.g. a shorter debug run). NOTE the schedule replays the
+    /// reference cycle over this many frames, so a value far from the reference's count desyncs the gradient
+    /// from the window timing.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..))]
     n_frames: u32,
     /// Mobility scans per frame (ignored in --reference-d mode: taken from the reference).
     #[arg(long, default_value_t = 709, value_parser = clap::value_parser!(u32).range(1..))]
@@ -169,6 +174,8 @@ struct Placement {
     im_min: f64,
     im_max: f64,
     reference_d: Option<String>,
+    /// The reference `.d`'s own frame count — the run length to inherit when `--n-frames 0`.
+    ref_n_frames: Option<u32>,
     to_tof: Box<dyn Fn(f64) -> u32>,
     to_scan: Box<dyn Fn(f64) -> u32>,
     to_mz: Box<dyn Fn(u32) -> f64>,
@@ -221,6 +228,7 @@ fn build_placement(a: &Args) -> Result<Placement> {
                 im_min: gm.one_over_k0_range_lower,
                 im_max: gm.one_over_k0_range_upper,
                 reference_d: Some(ref_s),
+                ref_n_frames: Some(frames.len() as u32),
                 to_tof: Box::new(move |m| mz_for_tof.mz_to_tof(m)),
                 to_scan: Box::new(move |k0| mob.one_over_k0_to_scan(k0)),
                 to_mz: Box::new(move |tof| mz.tof_to_mz(tof)),
@@ -240,6 +248,7 @@ fn build_placement(a: &Args) -> Result<Placement> {
                 im_min: a.im_min,
                 im_max: a.im_max,
                 reference_d: None,
+                ref_n_frames: None,
                 // tof = (sqrt(mz) - tof_intercept) / tof_slope ; scan = (1/K0 - scan_intercept) / scan_slope
                 to_tof: Box::new(move |m| ((m.sqrt() - tof_intercept) / tof_slope).max(0.0) as u32),
                 to_scan: Box::new(move |k0| ((k0 - scan_intercept) / scan_slope).max(0.0) as u32),
@@ -258,11 +267,22 @@ fn build_placement(a: &Args) -> Result<Placement> {
 }
 
 fn main() -> Result<()> {
-    let a = Args::parse();
+    let mut a = Args::parse();
     if !(a.intensity_scale.is_finite() && a.intensity_scale > 0.0) {
         return Err(anyhow!("--intensity-scale must be finite and > 0, got {}", a.intensity_scale));
     }
     let p = build_placement(&a)?;
+    // Resolve the run length: `--n-frames 0` inherits the reference `.d`'s own frame count (so the render
+    // matches the reference GRADIENT, the fix for the 5-min stub that crushed recall via co-elution) — or
+    // 3000 without a reference. A positive `--n-frames` is an explicit override.
+    if a.n_frames == 0 {
+        a.n_frames = p.ref_n_frames.unwrap_or(3000);
+        eprintln!(
+            "  n_frames = {} ({})",
+            a.n_frames,
+            if p.ref_n_frames.is_some() { "inherited from reference .d" } else { "default (no reference)" }
+        );
+    }
     let g = Geometry {
         n_frames: a.n_frames,
         n_scans: p.n_scans,
