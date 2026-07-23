@@ -37,8 +37,28 @@ struct Args {
     out_occurrences: Option<PathBuf>,
     #[arg(long)]
     out_cleavage_sites: Option<PathBuf>,
+    /// OPT-IN cap on the number of unique peptides. `0` (default) keeps the full ANALYTIC digest (every
+    /// peptide — the exact expectation). A positive value draws a DETERMINISTIC, seed-keyed RANDOM sample
+    /// of that many peptides (and filters occurrences to match) — for a tractable run on a large proteome
+    /// while keeping the full FASTA as the search space (v1's `num_sample_peptides`). Cleavage sites are
+    /// protein-level and kept in full.
+    #[arg(long, default_value_t = 0)]
+    max_peptides: u64,
+    /// Seed for `--max-peptides` sampling (ignored without a cap; the analytic digest has no seed).
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
     #[arg(long)]
     schema: bool,
+}
+
+/// splitmix64 — a stable, dep-free hash so the peptide sample is reproducible across runs (unlike the
+/// std hasher, whose output is not guaranteed stable).
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 fn main() -> Result<()> {
@@ -127,6 +147,25 @@ fn main() -> Result<()> {
     let mut peps: Vec<(u64, String, u16, f64)> =
         pep_seen.into_iter().map(|(k, (s, l, m))| (k, s, l, m)).collect();
     peps.sort_unstable_by_key(|p| p.0); // deterministic row order
+
+    // Opt-in peptide cap (v1's num_sample_peptides): a deterministic seed-keyed random sample for a
+    // tractable run on a large proteome, keeping the full FASTA as the search space. Occurrences are
+    // filtered to the kept peptides; cleavage sites are protein-level and kept in full.
+    let (mut o_pid, mut o_prot, mut o_start, mut o_end, mut o_mc) = (o_pid, o_prot, o_start, o_end, o_mc);
+    let full_peptides = peps.len();
+    if a.max_peptides > 0 && (peps.len() as u64) > a.max_peptides {
+        peps.sort_by_key(|p| splitmix64(p.0 ^ a.seed)); // random order keyed by (id, seed)
+        peps.truncate(a.max_peptides as usize);
+        peps.sort_unstable_by_key(|p| p.0); // restore id order
+        let kept: std::collections::HashSet<u64> = peps.iter().map(|p| p.0).collect();
+        let keep: Vec<usize> = (0..o_pid.len()).filter(|&i| kept.contains(&o_pid[i])).collect();
+        let (np, npr): (Vec<u64>, Vec<String>) = keep.iter().map(|&i| (o_pid[i], o_prot[i].clone())).unzip();
+        let ns: Vec<u32> = keep.iter().map(|&i| o_start[i]).collect();
+        let ne: Vec<u32> = keep.iter().map(|&i| o_end[i]).collect();
+        let nm: Vec<u16> = keep.iter().map(|&i| o_mc[i]).collect();
+        o_pid = np; o_prot = npr; o_start = ns; o_end = ne; o_mc = nm;
+        eprintln!("  --max-peptides       : sampled {} of {full_peptides} unique peptides (seed {})", a.max_peptides, a.seed);
+    }
 
     timsim_schema::write(&op, PEP::TABLE, &batch(PEP::TABLE, vec![
         Arc::new(UInt64Array::from(peps.iter().map(|p| p.0).collect::<Vec<_>>())) as ArrayRef,
