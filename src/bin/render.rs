@@ -131,6 +131,19 @@ struct Args {
     /// fit a memory budget; this forces streaming for huge uncapped datasets or byte-identity testing.
     #[arg(long, default_value_t = false)]
     no_parallel: bool,
+    /// Noise A1 — Gaussian m/z scatter on **precursor (MS1)** peaks, as a ppm standard deviation, applied
+    /// before m/z→tof so a search engine sees a realistic non-degenerate mass-error distribution to
+    /// calibrate against. `0` = off (byte-identical to the noiseless render). Seeded per
+    /// `(precursor_id, peak_index)` so adding an ion never reshuffles the others. See `REALISM_PLAN.md`.
+    #[arg(long, default_value_t = 0.0)]
+    noise_mz_ppm: f64,
+    /// Noise A1 — Gaussian m/z scatter on **fragment (MS2)** peaks (ppm standard deviation). `0` = off.
+    #[arg(long, default_value_t = 0.0)]
+    noise_frag_ppm: f64,
+    /// Seed for the noise draws. Same seed + same inputs → identical render; change it to draw a different
+    /// (still deterministic) mass-error realisation. Ignored when both noise ppm values are `0`.
+    #[arg(long, default_value_t = 0)]
+    noise_seed: u64,
     /// Render a DIA run: interleave MS1 + MS2 frames on the reference `.d`'s cycle, gate fragments by
     /// the diagonal quadrupole transmission. Requires `--reference-d` (a DIA `.d` for the schedule).
     #[arg(long, default_value_t = false)]
@@ -587,14 +600,34 @@ fn load_amounts(path: &Option<PathBuf>, sample: &Option<String>) -> Result<HashM
     Ok(out)
 }
 
-/// Deterministic `u64 -> [0, 1)` (splitmix64 finaliser). Identity-keyed randomness: the same id always
-/// maps to the same value, so per-ion draws (e.g. survival) don't reshuffle when the ion set changes.
-fn hash01(x: u64) -> f64 {
-    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+/// splitmix64 finaliser: a full-avalanche `u64 -> u64` bijection. Reused as both a 1-word hash and a
+/// mixing step when chaining several key fields together.
+fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    (z >> 11) as f64 / (1u64 << 53) as f64
+    z ^ (z >> 31)
+}
+
+/// Deterministic `u64 -> [0, 1)`. Identity-keyed randomness: the same id always maps to the same value, so
+/// per-ion draws (e.g. survival) don't reshuffle when the ion set changes.
+fn hash01(x: u64) -> f64 {
+    (splitmix64(x) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Deterministic standard-normal draw (mean 0, sd 1) for peak `k` of precursor `pc`, via Box–Muller over
+/// two decorrelated uniform draws. Identity-keyed on `(pc, is_frag, k, seed)` so the noise realisation is
+/// reproducible and stable under `--limit` — adding or removing ions leaves every other draw unchanged.
+/// The fields are folded in through successive `splitmix64` avalanches (NOT a single linear sum), so no
+/// field's contribution can be algebraically cancelled by another: the MS1 vs MS2 peak streams (`is_frag`)
+/// and distinct `seed`s stay genuinely independent, not merely offset. Used by A1 m/z-ppm scatter.
+fn gauss_unit(pc: u64, is_frag: bool, k: usize, seed: u64) -> f64 {
+    let mut z = splitmix64(seed ^ if is_frag { 0x9E37_79B9_7F4A_7C15 } else { 0 });
+    z = splitmix64(z ^ pc);
+    z = splitmix64(z ^ k as u64);
+    let u1 = ((splitmix64(z) >> 11) as f64 / (1u64 << 53) as f64).max(1e-12); // clamp away from ln(0)
+    let u2 = (splitmix64(z ^ 0xD1B5_4A32_D192_ED03) >> 11) as f64 / (1u64 << 53) as f64;
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }
 
 /// The mobility scan for a precursor: physical CCS→1/K0 (Mason-Schamp) when its CCS is known, else a
@@ -903,10 +936,19 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
     // one chunk's active ions rather than every precursor's spectra at once.
 
     // Project each precursor's spectra to tof and build DIA ions.
-    let project = |peaks: &[(f64, f32)]| -> Vec<(u32, f32)> {
+    let project = |pc: u64, is_frag: bool, peaks: &[(f64, f32)]| -> Vec<(u32, f32)> {
+        // A1 noise: Gaussian m/z scatter (ppm) applied per peak before m/z→tof. `ppm == 0` keeps `m`
+        // untouched, so the noiseless render stays byte-identical.
+        let ppm = if is_frag { a.noise_frag_ppm } else { a.noise_mz_ppm };
         peaks
             .iter()
-            .filter_map(|&(m, inten)| {
+            .enumerate()
+            .filter_map(|(k, &(m, inten))| {
+                let m = if ppm > 0.0 {
+                    m * (1.0 + gauss_unit(pc, is_frag, k, a.noise_seed) * ppm * 1e-6)
+                } else {
+                    m
+                };
                 if m < p.mz_min || m > p.mz_max {
                     None
                 } else {
@@ -1087,7 +1129,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 let mzv = mz.value(i); let mzv: &Float64Array = mzv.as_any().downcast_ref().unwrap();
                 let iv = inten.value(i); let iv: &Float32Array = iv.as_any().downcast_ref().unwrap();
                 let raw: Vec<(f64, f32)> = (0..mzv.len()).map(|k| (mzv.value(k), iv.value(k))).collect();
-                let proj = project(&raw);
+                let proj = project(pc, level.value(i) == 2, &raw);
                 let e = builders.entry(pc).or_insert((false, Vec::new(), Vec::new()));
                 match level.value(i) {
                     1 => { e.0 = true; e.1 = proj; }
@@ -1198,7 +1240,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 let iv = inten.value(i);
                 let iv: &Float32Array = iv.as_any().downcast_ref().unwrap();
                 let raw: Vec<(f64, f32)> = (0..mzv.len()).map(|k| (mzv.value(k), iv.value(k))).collect();
-                let proj = project(&raw);
+                let proj = project(pc, level.value(i) == 2, &raw);
                 let e = builders.entry(pc).or_insert((false, Vec::new(), Vec::new()));
                 match level.value(i) {
                     1 => { e.0 = true; e.1 = proj; }
