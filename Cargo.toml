@@ -58,6 +58,11 @@ tdf = ["dep:ms-io", "dep:mscore"]
 # thermorawfile-backed writer seam). Off by default so default builds don't pull the thermo dep.
 #   cargo build --release -p timsim-cli --features thermo
 thermo = ["dep:ms-io", "dep:timsim-core", "timsim-core/thermo", "dep:mscore"]
+# The SCIEX ZenoTOF SWATH -> open mzML render driver (timsim-render-sciex): pulls timsim-core's mzml
+# feature (mzdata-backed writer) + mscore (quadrupole transmission). NO ms-io, NO thermorawfile, NO
+# sciexwiff/sciex-io — the lean mzML path is legally clean (native .wiff is a rustims-local satellite).
+#   cargo build --release -p timsim-cli --features sciex
+sciex = ["dep:timsim-core", "timsim-core/mzml", "dep:mscore"]
 
 [[bin]]
 name = "timsim-modify"
@@ -87,6 +92,11 @@ required-features = ["tdf"]
 name = "timsim-render-thermo"
 path = "src/bin/render_thermo.rs"
 required-features = ["thermo"]
+
+[[bin]]
+name = "timsim-render-sciex"
+path = "src/bin/render_sciex.rs"
+required-features = ["sciex"]
 
 # Instrument-independent MS1+MS2 spectrum materialisation (mscore). Needs the tdf feature (mscore).
 [[bin]]
