@@ -148,9 +148,33 @@ struct Args {
     #[arg(long, default_value_t = false)]
     noise_mz_uniform: bool,
     /// Seed for the noise draws. Same seed + same inputs → identical render; change it to draw a different
-    /// (still deterministic) mass-error realisation. Ignored when both noise ppm values are `0`.
+    /// (still deterministic) mass-error / background realisation. Ignored when noise is off.
     #[arg(long, default_value_t = 0)]
     noise_seed: u64,
+    /// Noise A2 — inject **real background peaks sampled from the reference `.d`** onto the rendered frames
+    /// (v1's `add_real_data_noise`). Per output frame: sample `--noise-*-frames` reference frames of the
+    /// matching type (MS1, or MS2 of the same DIA window group), keep real peaks with intensity in
+    /// `[1, --noise-intensity-max]`, downsample each by the take-fraction, and add (real detector counts) on
+    /// top of the synthetic signal. Bruker DIA only. `off` (default) = byte-identical noiseless render.
+    /// Seeded (deterministic) — v1 uses a thread RNG; we match the distribution, not the bytes. REALISM_PLAN.
+    #[arg(long, default_value_t = false)]
+    noise_real_data: bool,
+    /// A2: reference MS1 frames sampled per output precursor frame (v1 `num_precursor_noise_frames`).
+    #[arg(long, default_value_t = 5)]
+    noise_precursor_frames: usize,
+    /// A2: reference MS2 frames sampled per output fragment frame (v1 `num_fragment_noise_frames`).
+    #[arg(long, default_value_t = 5)]
+    noise_fragment_frames: usize,
+    /// A2: keep only real peaks with intensity ≤ this (absolute detector counts) — the background cap
+    /// (v1 `reference_noise_intensity_max`, real config 150000). NOT scaled by `--intensity-scale`.
+    #[arg(long, default_value_t = 150000.0)]
+    noise_intensity_max: f64,
+    /// A2: probability of keeping each sampled MS1 background peak (v1 `precursor_sample_fraction`).
+    #[arg(long, default_value_t = 0.2)]
+    noise_precursor_fraction: f64,
+    /// A2: probability of keeping each sampled MS2 background peak (v1 `fragment_sample_fraction`).
+    #[arg(long, default_value_t = 0.2)]
+    noise_fragment_fraction: f64,
     /// Render a DIA run: interleave MS1 + MS2 frames on the reference `.d`'s cycle, gate fragments by
     /// the diagonal quadrupole transmission. Requires `--reference-d` (a DIA `.d` for the schedule).
     #[arg(long, default_value_t = false)]
@@ -451,7 +475,7 @@ fn main() -> Result<()> {
             }
             next_fid += 1;
         }
-        let (scans, tofs, ints) = dedup_and_quantise(e.triples, a.intensity_scale, a.min_peak_intensity);
+        let (scans, tofs, ints) = dedup_and_quantise(e.triples, a.intensity_scale, a.min_peak_intensity, &[]);
         total_peaks += scans.len() as u64;
         if let Err(x) = write_frame(&mut writer, target, 0, a.cycle_seconds, scans, tofs, ints) {
             err = Err(x);
@@ -516,7 +540,15 @@ impl std::hash::Hasher for FxHasher {
 }
 type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
 
-fn dedup_and_quantise(triples: &[(u32, u32, f64)], scale: f64, floor: u32) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+/// Sum synthetic contributions per (scan, tof), scale to detector counts, and — for A2 — add real
+/// background counts from `noise` on top (already absolute counts, NOT scaled), exactly like v1's
+/// `frame + noise`. `noise` empty ⇒ byte-identical to the noiseless render.
+fn dedup_and_quantise(
+    triples: &[(u32, u32, f64)],
+    scale: f64,
+    floor: u32,
+    noise: &[(u32, u32, f64)],
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     debug_assert!(scale.is_finite() && scale > 0.0, "intensity_scale must be finite and > 0");
     const CEIL: f64 = u32::MAX as f64;
     // Pack (scan, tof) into a single u64 key so one cheap u64 hash replaces the tuple's two-field SipHash.
@@ -524,6 +556,12 @@ fn dedup_and_quantise(triples: &[(u32, u32, f64)], scale: f64, floor: u32) -> (V
         HashMap::with_capacity_and_hasher(triples.len(), Default::default());
     for &(scan, tof, v) in triples {
         *summed.entry(((scan as u64) << 32) | tof as u64).or_insert(0.0) += v;
+    }
+    // A2 background: real detector counts keyed the same way, added AFTER the synthetic scale.
+    let mut noise_at: HashMap<u64, f64, FxBuild> =
+        HashMap::with_capacity_and_hasher(noise.len(), Default::default());
+    for &(scan, tof, c) in noise {
+        *noise_at.entry(((scan as u64) << 32) | tof as u64).or_insert(0.0) += c;
     }
     let (mut scans, mut tofs, mut ints) = (Vec::new(), Vec::new(), Vec::new());
     for (key, v) in summed {
@@ -538,7 +576,19 @@ fn dedup_and_quantise(triples: &[(u32, u32, f64)], scale: f64, floor: u32) -> (V
                 scaled, CEIL
             );
         }
-        let q = scaled.min(CEIL) as u32;
+        // Add + consume any co-located background so a shared (scan, tof) bin isn't emitted twice.
+        let q = (scaled + noise_at.remove(&key).unwrap_or(0.0)).min(CEIL) as u32;
+        if q < floor.max(1) {
+            continue;
+        }
+        scans.push(scan);
+        tofs.push(tof);
+        ints.push(q);
+    }
+    // Background-only bins (no synthetic signal at that (scan, tof)).
+    for (key, c) in noise_at {
+        let (scan, tof) = ((key >> 32) as u32, key as u32);
+        let q = c.min(CEIL) as u32;
         if q < floor.max(1) {
             continue;
         }
@@ -547,6 +597,106 @@ fn dedup_and_quantise(triples: &[(u32, u32, f64)], scale: f64, floor: u32) -> (V
         ints.push(q);
     }
     (scans, tofs, ints)
+}
+
+/// A2 identity-keyed state for slot `s` (one of the `num_frames` sampled) of output frame `f`. Successive
+/// splitmix64 avalanches (like `noise_state`) so `(f, s)` decorrelate. `s` distinguishes the sampled slots
+/// so the same reference frame picked twice among the slots gets independent downsamples (v1's
+/// with-replacement semantics).
+fn a2_state(f: u32, s: usize, seed: u64) -> u64 {
+    let z = splitmix64(seed ^ 0xA2A2_A2A2_A2A2_A2A2);
+    splitmix64(splitmix64(z ^ f as u64) ^ s as u64)
+}
+
+/// A2 — build the per-output-frame real-data background by sampling the reference `.d`. Returns
+/// `frame_id -> Vec<(scan, tof, count)>` (real detector counts, deposited on top of the synthetic signal in
+/// `dedup_and_quantise`). Ports v1's `add_real_data_noise_to_frames` (DIA branch): per output frame, sample
+/// `num_frames` reference frames of the matching type (MS1, or MS2 of the same DIA window group), keep peaks
+/// with intensity in `[1, intensity_max]` (v1 `filter_ranged`), downsample each by the take-fraction. Made
+/// deterministic (seeded) instead of v1's thread RNG; each unique reference frame is decoded + filtered once
+/// and cached. Frames are classified via the schedule (NOT a 1:1 output↔reference assumption); pools come
+/// from the reference metadata.
+#[allow(clippy::too_many_arguments)]
+fn build_frame_noise(
+    ref_d: &str,
+    sched: &timsim_cli::dia::DiaSchedule,
+    n_frames: u32,
+    n_scans: u32,
+    tof_max: u32,
+    seed: u64,
+    prec_frames: usize,
+    frag_frames: usize,
+    intensity_max: f64,
+    prec_frac: f64,
+    frag_frac: f64,
+) -> Result<HashMap<u32, Vec<(u32, u32, f64)>>> {
+    use ms_io::data::dataset::TimsDataset;
+    use ms_io::data::meta::read_dia_ms_ms_info;
+
+    let ds = TimsDataset::new("", ref_d, false, false);
+    // Pools from the reference metadata: MS1 = precursor frames; MS2 = frames grouped by DIA window group.
+    let meta = read_meta_data_sql(ref_d).map_err(|e| anyhow!("A2: read frame meta: {e}"))?;
+    let ms1_pool: Vec<u32> = meta.iter().filter(|m| m.ms_ms_type == 0).map(|m| m.id as u32).collect();
+    let info = read_dia_ms_ms_info(ref_d).map_err(|e| anyhow!("A2: read DiaFrameMsMsInfo: {e}"))?;
+    let mut ms2_pools: HashMap<u32, Vec<u32>> = HashMap::new();
+    for i in &info {
+        ms2_pools.entry(i.window_group).or_default().push(i.frame_id);
+    }
+
+    let mut cache: HashMap<u32, Vec<(u32, u32, f64)>> = HashMap::new();
+    let mut frame_noise: HashMap<u32, Vec<(u32, u32, f64)>> = HashMap::new();
+
+    for f in 1..=n_frames {
+        let (pool, nf, frac): (&Vec<u32>, usize, f64) = match sched.window_group(f) {
+            None => (&ms1_pool, prec_frames, prec_frac),
+            Some(g) => (
+                ms2_pools
+                    .get(&g)
+                    .ok_or_else(|| anyhow!("A2: reference has no MS2 frames for window group {g}"))?,
+                frag_frames,
+                frag_frac,
+            ),
+        };
+        if pool.is_empty() {
+            return Err(anyhow!("A2: empty reference noise pool for frame {f}"));
+        }
+        let mut peaks: Vec<(u32, u32, f64)> = Vec::new();
+        for s in 0..nf {
+            let base = a2_state(f, s, seed);
+            // Unbiased pick with replacement (multiply-high, not modulo).
+            let idx = ((splitmix64(base) as u128 * pool.len() as u128) >> 64) as usize;
+            let rid = pool[idx];
+            if !cache.contains_key(&rid) {
+                let fr = ds.get_frame(rid).filter_ranged(
+                    0.0, 2000.0, 0, n_scans as i32, 0.0, 5.0, 1.0, intensity_max, 0, i32::MAX,
+                );
+                let v: Vec<(u32, u32, f64)> = fr
+                    .scan
+                    .iter()
+                    .zip(fr.tof.iter())
+                    .zip(fr.ims_frame.intensity.iter())
+                    .filter_map(|((&sc, &tf), &it)| {
+                        if sc >= 0 && tf >= 0 { Some((sc as u32, tf as u32, it)) } else { None }
+                    })
+                    .collect();
+                cache.insert(rid, v);
+            }
+            for (pk, &(scan, tof, inten)) in cache[&rid].iter().enumerate() {
+                if scan >= n_scans || tof >= tof_max {
+                    continue; // reference peak falls outside our (possibly overridden) output grid
+                }
+                // Keep this peak with probability `frac`, independently per (frame, slot, peak).
+                let keep = (splitmix64(base.wrapping_add(pk as u64 + 1)) >> 11) as f64 / (1u64 << 53) as f64;
+                if keep < frac {
+                    peaks.push((scan, tof, inten));
+                }
+            }
+        }
+        if !peaks.is_empty() {
+            frame_noise.insert(f, peaks);
+        }
+    }
+    Ok(frame_noise)
 }
 
 /// Standard TIMS gas / temperature for Mason-Schamp (N2 at ~305 K — the imspy defaults the CCS model
@@ -870,7 +1020,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                         }
                     }
                 }
-                let (scans, tofs, ints) = dedup_and_quantise(&tri, a.intensity_scale, a.min_peak_intensity);
+                let (scans, tofs, ints) = dedup_and_quantise(&tri, a.intensity_scale, a.min_peak_intensity, &[]);
                 if is_ms1 { c_ms1 += scans.len() as u64 } else { c_ms2 += scans.len() as u64 }
                 let blk = ms_io::data::tdf_writer::encode_frame_block(&scans, &tofs, &ints, n_scans, compression_level)
                     .map_err(|e| e.to_string())?;
@@ -957,6 +1107,22 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
     let ref_d = a.reference_d.as_ref().ok_or_else(|| anyhow!("--dia requires --reference-d (a DIA .d for the window schedule)"))?;
     let sched = DiaSchedule::from_reference(ref_d.to_str().unwrap(), a.n_frames, p.n_scans)?;
     eprintln!("  DIA schedule: cycle_len {}, {} windows", sched.cycle_len, sched.windows.len());
+
+    // A2 — real-data background sampled from the reference `.d` (empty map when off → byte-identical). Built
+    // once, sequentially (single reader), then read-only across the parallel render.
+    let frame_noise: HashMap<u32, Vec<(u32, u32, f64)>> = if a.noise_real_data {
+        let fn_map = build_frame_noise(
+            ref_d.to_str().unwrap(), &sched, a.n_frames, p.n_scans, p.tof_max, a.noise_seed,
+            a.noise_precursor_frames, a.noise_fragment_frames, a.noise_intensity_max,
+            a.noise_precursor_fraction, a.noise_fragment_fraction,
+        )?;
+        let total: usize = fn_map.values().map(|v| v.len()).sum();
+        eprintln!("  A2 real-data noise: {} background peaks across {} frames (seed {})",
+            total, fn_map.len(), a.noise_seed);
+        fn_map
+    } else {
+        HashMap::new()
+    };
 
     // ion_spectra is NOT loaded up front — it is streamed once per apex-chunk below, so peak memory is
     // one chunk's active ions rather than every precursor's spectra at once.
@@ -1219,7 +1385,8 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             let mut err: Option<String> = None;
             dia_render_range(&subset, &sched, g, fc0, fc1, |frame, ms_type, tri| {
                 if err.is_some() { return; }
-                let (scans, tofs, ints) = dedup_and_quantise(tri, iscale, floor);
+                let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
+                let (scans, tofs, ints) = dedup_and_quantise(tri, iscale, floor, fnoise);
                 if ms_type == 0 { c1 += scans.len() as u64 } else { c2 += scans.len() as u64 }
                 match ms_io::data::tdf_writer::encode_frame_block(&scans, &tofs, &ints, n_scans, 1) {
                     Ok(blk) => out.push((frame, ms_type, blk)),
@@ -1322,7 +1489,8 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 }
                 next_fid += 1;
             }
-            let (scans, tofs, ints) = dedup_and_quantise(tri, a.intensity_scale, a.min_peak_intensity);
+            let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
+            let (scans, tofs, ints) = dedup_and_quantise(tri, a.intensity_scale, a.min_peak_intensity, fnoise);
             if ms_type == 0 { ms1_peaks += scans.len() as u64 } else { ms2_peaks += scans.len() as u64 }
             if let Err(x) = write_frame(&mut writer, frame, ms_type, a.cycle_seconds, scans, tofs, ints) {
                 err = Err(x);
@@ -1505,5 +1673,35 @@ mod noise_tests {
             if noise_state(5, false, k, 1) == noise_state(5, true, k, 1) { collisions += 1; }
         }
         assert_eq!(collisions, 0, "MS1/MS2 key collisions: {collisions}");
+    }
+
+    // A2: the seeded per-peak keep decision must keep ≈ take_probability of peaks (v1's
+    // generate_random_sample, made deterministic). Uses the same base/keep formula as build_frame_noise.
+    #[test]
+    fn a2_downsample_keeps_take_probability() {
+        use super::{a2_state, splitmix64};
+        let base = a2_state(123, 2, 7);
+        let (n, frac) = (400_000usize, 0.2);
+        let kept = (0..n)
+            .filter(|&pk| ((splitmix64(base.wrapping_add(pk as u64 + 1)) >> 11) as f64 / (1u64 << 53) as f64) < frac)
+            .count();
+        let rate = kept as f64 / n as f64;
+        assert!((rate - frac).abs() < 0.005, "keep rate {rate} vs {frac}");
+    }
+
+    // A2: the multiply-high reference-frame pick is unbiased and always in range (never the modulo-bias trap).
+    #[test]
+    fn a2_frame_pick_in_range() {
+        use super::{a2_state, splitmix64};
+        let len = 37usize;
+        let mut counts = vec![0u32; len];
+        for f in 0..20_000u32 {
+            let base = a2_state(f, 0, 3);
+            let idx = ((splitmix64(base) as u128 * len as u128) >> 64) as usize;
+            assert!(idx < len, "idx {idx} >= {len}");
+            counts[idx] += 1;
+        }
+        // roughly uniform: every bucket hit, none wildly over/under (20000/37 ≈ 540 expected)
+        assert!(counts.iter().all(|&c| c > 350 && c < 750), "non-uniform pick: {counts:?}");
     }
 }
