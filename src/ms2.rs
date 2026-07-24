@@ -188,7 +188,7 @@ pub fn dia_render<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
     g: &Geometry,
     emit: F,
 ) {
-    dia_render_range(ions, sched, g, 1, g.n_frames, emit);
+    dia_render_range(ions, sched, g, 1, g.n_frames, false, emit);
 }
 
 /// The sweep restricted to frames `[frame_lo, frame_hi]` — the primitive the chunked streaming render
@@ -196,12 +196,17 @@ pub fn dia_render<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
 /// every ion active anywhere in the range (frame_start ≤ frame_hi and frame_end ≥ frame_lo); ions whose
 /// window opened before `frame_lo` are correctly entered at `frame_lo`. Emits only frames in the range,
 /// so a caller stitching ranges together writes each frame exactly once.
+/// `emit_all`: when true, call `emit` for EVERY frame in the range (with an empty buffer where no ion
+/// deposits), so a caller that adds per-frame background (A2 real-data noise / spike-into-real) reaches
+/// frames with no synthetic signal too. When false (the default render), only frames with a non-empty
+/// deposit are emitted — byte-identical to the frame-major render.
 pub fn dia_render_range<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
     ions: &[DiaIon],
     sched: &DiaSchedule,
     g: &Geometry,
     frame_lo: u32,
     frame_hi: u32,
+    emit_all: bool,
     mut emit: F,
 ) {
     let n = ions.len();
@@ -220,11 +225,17 @@ pub fn dia_render_range<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
         }
         // Leave ions whose window has closed.
         active.retain(|&i| windows[i].1 >= frame);
+        let ms_level = sched.ms_level(frame);
+        let ms_type = if ms_level == 1 { 0 } else { 9 };
         if active.is_empty() {
+            // No synthetic deposit here. Still emit (empty) when the caller wants every frame, so its
+            // per-frame background reaches this frame; otherwise skip it (unchanged render).
+            if emit_all {
+                emit(frame, ms_type, &[]);
+            }
             continue;
         }
         active.sort_unstable(); // visit in original-index order -> deterministic, frame-major-identical
-        let ms_level = sched.ms_level(frame);
         let f = frame as f64;
         let mut buf: Vec<(u32, u32, f64)> = Vec::new();
         for &idx in &active {
@@ -275,8 +286,8 @@ pub fn dia_render_range<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
                 }
             }
         }
-        if !buf.is_empty() {
-            emit(frame, if ms_level == 1 { 0 } else { 9 }, &buf);
+        if emit_all || !buf.is_empty() {
+            emit(frame, ms_type, &buf);
         }
     }
 }

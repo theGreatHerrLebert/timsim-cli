@@ -175,12 +175,20 @@ struct Args {
     /// A2: probability of keeping each sampled MS2 background peak (v1 `fragment_sample_fraction`).
     #[arg(long, default_value_t = 0.2)]
     noise_fragment_fraction: f64,
-    /// A2 background control: deposit ONLY the real-data background (skip the synthetic signal), so a search
-    /// of this `.d` yields the reference blank's real IDs. Run it at the SAME `--noise-seed` as the real
-    /// render, then pass its DiaNN report to the scorer's `--background-report` — those IDs are real
-    /// peptides, not FPs, and must be subtracted from FDP. Requires `--noise-real-data`. See REALISM_PLAN.
+    /// A2 background control (also spike-into control): deposit ONLY the real-data background / real frames
+    /// (skip the synthetic signal), so a search of this `.d` yields the real IDs to subtract from FDP. Run
+    /// at the same seed as the real render, then pass its DiaNN report to the scorer's `--background-report`.
+    /// Requires `--noise-real-data` OR `--spike-into`. See REALISM_PLAN.md.
     #[arg(long, default_value_t = false)]
     noise_only: bool,
+    /// Spike-into-real (mode B): overlay the synthetic signal **additively onto a REAL `.d`** instead of a
+    /// blank template — the real run is the background (real co-elution, noise, dynamic range) and only the
+    /// synthetic spikes are labeled. Copies every real frame's peaks and adds the synthetic deposits on top
+    /// (v1's `superimpose_reference_frames`). Implies `--reference-d <this>` (geometry, calibration, 1:1
+    /// frame mapping all come from the spike target). Requires a regular DIA run (frame 1 = MS1, contiguous
+    /// frame ids, `--n-frames` == the real frame count). Mutually exclusive with `--noise-real-data`.
+    #[arg(long)]
+    spike_into: Option<PathBuf>,
     /// Render a DIA run: interleave MS1 + MS2 frames on the reference `.d`'s cycle, gate fragments by
     /// the diagonal quadrupole transmission. Requires `--reference-d` (a DIA `.d` for the schedule).
     #[arg(long, default_value_t = false)]
@@ -326,6 +334,25 @@ fn main() -> Result<()> {
     if !(a.intensity_scale.is_finite() && a.intensity_scale > 0.0) {
         return Err(anyhow!("--intensity-scale must be finite and > 0, got {}", a.intensity_scale));
     }
+    // --spike-into implies the reference geometry + calibration come from that same real run (1:1 frames).
+    if let Some(spike) = a.spike_into.clone() {
+        if a.noise_real_data {
+            return Err(anyhow!(
+                "--spike-into and --noise-real-data are mutually exclusive: spike copies a real run's \
+                 frames; A2 samples background from a blank"
+            ));
+        }
+        match &a.reference_d {
+            Some(r) if r != &spike => {
+                return Err(anyhow!(
+                    "--spike-into {} conflicts with --reference-d {} — the spike geometry must come from \
+                     the spike target",
+                    spike.display(), r.display()
+                ))
+            }
+            _ => a.reference_d = Some(spike),
+        }
+    }
     let p = build_placement(&a)?;
     // Resolve the run length: `--n-frames 0` inherits the reference `.d`'s own frame count (so the render
     // matches the reference GRADIENT, the fix for the 5-min stub that crushed recall via co-elution) — or
@@ -337,6 +364,14 @@ fn main() -> Result<()> {
             a.n_frames,
             if p.ref_n_frames.is_some() { "inherited from reference .d" } else { "default (no reference)" }
         );
+    }
+    // Spike-into requires an exact 1:1 output↔real frame mapping — reject any n_frames != the real count
+    // (use `--n-frames 0` to inherit it). Otherwise `get_frame(f)` would not be the real f-th frame.
+    if a.spike_into.is_some() && p.ref_n_frames != Some(a.n_frames) {
+        return Err(anyhow!(
+            "--spike-into needs --n-frames == the real frame count ({}); got {}. Use --n-frames 0 to inherit.",
+            p.ref_n_frames.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()), a.n_frames
+        ));
     }
     let g = Geometry {
         n_frames: a.n_frames,
@@ -603,8 +638,11 @@ fn dedup_and_quantise(
                 c, CEIL
             );
         }
+        // Real background/spike bins are actual detector counts, NOT synthetic quantisation haze, so they
+        // are exempt from `--min-peak-intensity` (only zero is dropped). This keeps a `--spike-into ...
+        // --noise-only` render a faithful copy of the real `.d` even under a raised floor.
         let q = c.min(CEIL) as u32;
-        if q < floor.max(1) {
+        if q < 1 {
             continue;
         }
         scans.push(scan);
@@ -717,6 +755,60 @@ fn build_frame_noise(
             frame_noise.insert(f, peaks);
         }
     }
+    Ok(frame_noise)
+}
+
+/// Spike-into-real (mode B): every real frame's peaks, keyed by frame id, for additive overlay of the
+/// synthetic signal onto a REAL run (v1's `superimpose_reference_frames`: `output[f] = real[f] +
+/// synthetic[f]`). Unlike A2 there is no pool / sampling / `[1,cap]` filter / downsample — the FULL real
+/// frame `f` is deposited onto output frame `f` (1:1). The peaks flow through `dedup_and_quantise`'s
+/// background path (added as real counts, floor-exempt), so a shared `(scan, tof)` bin sums real+synthetic.
+/// Validates the reference frame ids are contiguous `1..=n_frames` so `get_frame(f)` is the real f-th frame.
+fn build_spike_frames(
+    ref_d: &str,
+    n_frames: u32,
+    n_scans: u32,
+    tof_max: u32,
+) -> Result<HashMap<u32, Vec<(u32, u32, f64)>>> {
+    use ms_io::data::dataset::TimsDataset;
+    let ds = TimsDataset::new("", ref_d, false, false);
+    let meta = read_meta_data_sql(ref_d).map_err(|e| anyhow!("spike: read frame meta: {e}"))?;
+    let ids: std::collections::HashSet<u32> = meta.iter().map(|m| m.id as u32).collect();
+    for f in 1..=n_frames {
+        if !ids.contains(&f) {
+            return Err(anyhow!(
+                "--spike-into: reference frame ids are not contiguous 1..={n_frames} (missing {f}) — \
+                 an irregular run is out of scope"
+            ));
+        }
+    }
+    let mut frame_noise: HashMap<u32, Vec<(u32, u32, f64)>> = HashMap::with_capacity(n_frames as usize);
+    let mut total: u64 = 0;
+    for f in 1..=n_frames {
+        let fr = ds.get_frame(f);
+        let v: Vec<(u32, u32, f64)> = fr
+            .scan
+            .iter()
+            .zip(fr.tof.iter())
+            .zip(fr.ims_frame.intensity.iter())
+            .filter_map(|((&sc, &tf), &it)| {
+                if sc >= 0 && tf >= 0 && (sc as u32) < n_scans && (tf as u32) < tof_max {
+                    Some((sc as u32, tf as u32, it))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        total += v.len() as u64;
+        if !v.is_empty() {
+            frame_noise.insert(f, v);
+        }
+    }
+    let mb = (total as usize * std::mem::size_of::<(u32, u32, f64)>()) / (1024 * 1024);
+    eprintln!(
+        "  spike-into-real: {} real peaks copied across {} frames (~{} MB resident)",
+        total, frame_noise.len(), mb
+    );
     Ok(frame_noise)
 }
 
@@ -1129,12 +1221,19 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
     let sched = DiaSchedule::from_reference(ref_d.to_str().unwrap(), a.n_frames, p.n_scans)?;
     eprintln!("  DIA schedule: cycle_len {}, {} windows", sched.cycle_len, sched.windows.len());
 
-    // A2 — real-data background sampled from the reference `.d` (empty map when off → byte-identical). Built
-    // once, sequentially (single reader), then read-only across the parallel render.
-    if a.noise_only && !a.noise_real_data {
-        return Err(anyhow!("--noise-only requires --noise-real-data (it renders the A2 background alone)"));
+    // Extra real peaks to deposit per frame — A2 sampled background OR spike-into full real frames (empty
+    // when neither → byte-identical). Built once, sequentially (single reader), read-only across the render.
+    if a.noise_only && !a.noise_real_data && a.spike_into.is_none() {
+        return Err(anyhow!("--noise-only requires --noise-real-data or --spike-into (it renders the background alone)"));
     }
-    let frame_noise: HashMap<u32, Vec<(u32, u32, f64)>> = if a.noise_real_data {
+    let frame_noise: HashMap<u32, Vec<(u32, u32, f64)>> = if let Some(spike) = a.spike_into.as_ref() {
+        // Spike-into needs the schedule's replayed MS1/MS2 cycle to match the real run's actual sequence;
+        // guard the common failure (a run not starting on an MS1 frame). Full 1:1 was enforced in main().
+        if sched.ms_level(1) != 1 {
+            return Err(anyhow!("--spike-into needs a regular DIA run starting with an MS1 frame"));
+        }
+        build_spike_frames(spike.to_str().unwrap(), a.n_frames, p.n_scans, p.tof_max)?
+    } else if a.noise_real_data {
         let fn_map = build_frame_noise(
             ref_d.to_str().unwrap(), &sched, a.n_frames, p.n_scans, p.tof_max, a.noise_seed,
             a.noise_precursor_frames, a.noise_fragment_frames, a.noise_intensity_max,
@@ -1398,6 +1497,9 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         type ChunkOut = (Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)>, u64, u64);
         let (n_scans, iscale, floor, noise_only) =
             (p.n_scans, a.intensity_scale, a.min_peak_intensity, a.noise_only);
+        // With per-frame background (A2 / spike), every frame must be visited so its real peaks land even
+        // where no synthetic ion is active. Off ⇒ false ⇒ unchanged render.
+        let emit_all = !frame_noise.is_empty();
         let chunks: Vec<Result<ChunkOut, String>> = (0..pn).into_par_iter().map(|c| {
             let (fc0, fc1) = (pbounds[c as usize], pbounds[c as usize + 1] - 1);
             if fc1 < fc0 { return Ok((Vec::new(), 0, 0)); }
@@ -1408,11 +1510,12 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             let (mut c1, mut c2) = (0u64, 0u64);
             let mut out: Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)> = Vec::new();
             let mut err: Option<String> = None;
-            dia_render_range(&subset, &sched, g, fc0, fc1, |frame, ms_type, tri| {
+            dia_render_range(&subset, &sched, g, fc0, fc1, emit_all, |frame, ms_type, tri| {
                 if err.is_some() { return; }
                 let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
                 let syn: &[(u32, u32, f64)] = if noise_only { &[] } else { tri };
                 let (scans, tofs, ints) = dedup_and_quantise(syn, iscale, floor, fnoise);
+                if scans.is_empty() { return; } // truly-empty frame → leave a gap (written empty on append)
                 if ms_type == 0 { c1 += scans.len() as u64 } else { c2 += scans.len() as u64 }
                 match ms_io::data::tdf_writer::encode_frame_block(&scans, &tofs, &ints, n_scans, 1) {
                     Ok(blk) => out.push((frame, ms_type, blk)),
@@ -1504,9 +1607,16 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         let ions: Vec<DiaIon> = ions.into_iter().map(|x| x.1).collect();
 
         let mut err: Result<()> = Ok(());
-        dia_render_range(&ions, &sched, g, fc0, fc1, |frame, ms_type, tri| {
+        let emit_all = !frame_noise.is_empty();
+        dia_render_range(&ions, &sched, g, fc0, fc1, emit_all, |frame, ms_type, tri| {
             if err.is_err() {
                 return;
+            }
+            let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
+            let syn: &[(u32, u32, f64)] = if a.noise_only { &[] } else { tri };
+            let (scans, tofs, ints) = dedup_and_quantise(syn, a.intensity_scale, a.min_peak_intensity, fnoise);
+            if scans.is_empty() {
+                return; // truly-empty frame → leave a gap (filled empty by the next write / trailing loop)
             }
             while next_fid < frame {
                 if let Err(x) = write_frame(&mut writer, next_fid, gap_ms(next_fid), a.cycle_seconds, Vec::new(), Vec::new(), Vec::new()) {
@@ -1515,9 +1625,6 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 }
                 next_fid += 1;
             }
-            let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
-            let syn: &[(u32, u32, f64)] = if a.noise_only { &[] } else { tri };
-            let (scans, tofs, ints) = dedup_and_quantise(syn, a.intensity_scale, a.min_peak_intensity, fnoise);
             if ms_type == 0 { ms1_peaks += scans.len() as u64 } else { ms2_peaks += scans.len() as u64 }
             if let Err(x) = write_frame(&mut writer, frame, ms_type, a.cycle_seconds, scans, tofs, ints) {
                 err = Err(x);
