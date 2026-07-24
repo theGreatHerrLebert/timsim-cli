@@ -175,6 +175,12 @@ struct Args {
     /// A2: probability of keeping each sampled MS2 background peak (v1 `fragment_sample_fraction`).
     #[arg(long, default_value_t = 0.2)]
     noise_fragment_fraction: f64,
+    /// A2 background control: deposit ONLY the real-data background (skip the synthetic signal), so a search
+    /// of this `.d` yields the reference blank's real IDs. Run it at the SAME `--noise-seed` as the real
+    /// render, then pass its DiaNN report to the scorer's `--background-report` — those IDs are real
+    /// peptides, not FPs, and must be subtracted from FDP. Requires `--noise-real-data`. See REALISM_PLAN.
+    #[arg(long, default_value_t = false)]
+    noise_only: bool,
     /// Render a DIA run: interleave MS1 + MS2 frames on the reference `.d`'s cycle, gate fragments by
     /// the diagonal quadrupole transmission. Requires `--reference-d` (a DIA `.d` for the schedule).
     #[arg(long, default_value_t = false)]
@@ -1110,6 +1116,9 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
 
     // A2 — real-data background sampled from the reference `.d` (empty map when off → byte-identical). Built
     // once, sequentially (single reader), then read-only across the parallel render.
+    if a.noise_only && !a.noise_real_data {
+        return Err(anyhow!("--noise-only requires --noise-real-data (it renders the A2 background alone)"));
+    }
     let frame_noise: HashMap<u32, Vec<(u32, u32, f64)>> = if a.noise_real_data {
         let fn_map = build_frame_noise(
             ref_d.to_str().unwrap(), &sched, a.n_frames, p.n_scans, p.tof_max, a.noise_seed,
@@ -1372,7 +1381,8 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         // 3) Render + encode each chunk in PARALLEL. The closure is pure: reads `ions`/`sched`/`g`, calls
         //    the Sync `apply_transmission`, and emits owned EncodedBlocks. Gated memory bounds the collect.
         type ChunkOut = (Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)>, u64, u64);
-        let (n_scans, iscale, floor) = (p.n_scans, a.intensity_scale, a.min_peak_intensity);
+        let (n_scans, iscale, floor, noise_only) =
+            (p.n_scans, a.intensity_scale, a.min_peak_intensity, a.noise_only);
         let chunks: Vec<Result<ChunkOut, String>> = (0..pn).into_par_iter().map(|c| {
             let (fc0, fc1) = (pbounds[c as usize], pbounds[c as usize + 1] - 1);
             if fc1 < fc0 { return Ok((Vec::new(), 0, 0)); }
@@ -1386,7 +1396,8 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             dia_render_range(&subset, &sched, g, fc0, fc1, |frame, ms_type, tri| {
                 if err.is_some() { return; }
                 let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
-                let (scans, tofs, ints) = dedup_and_quantise(tri, iscale, floor, fnoise);
+                let syn: &[(u32, u32, f64)] = if noise_only { &[] } else { tri };
+                let (scans, tofs, ints) = dedup_and_quantise(syn, iscale, floor, fnoise);
                 if ms_type == 0 { c1 += scans.len() as u64 } else { c2 += scans.len() as u64 }
                 match ms_io::data::tdf_writer::encode_frame_block(&scans, &tofs, &ints, n_scans, 1) {
                     Ok(blk) => out.push((frame, ms_type, blk)),
@@ -1490,7 +1501,8 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 next_fid += 1;
             }
             let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
-            let (scans, tofs, ints) = dedup_and_quantise(tri, a.intensity_scale, a.min_peak_intensity, fnoise);
+            let syn: &[(u32, u32, f64)] = if a.noise_only { &[] } else { tri };
+            let (scans, tofs, ints) = dedup_and_quantise(syn, a.intensity_scale, a.min_peak_intensity, fnoise);
             if ms_type == 0 { ms1_peaks += scans.len() as u64 } else { ms2_peaks += scans.len() as u64 }
             if let Err(x) = write_frame(&mut writer, frame, ms_type, a.cycle_seconds, scans, tofs, ints) {
                 err = Err(x);
