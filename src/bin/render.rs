@@ -572,18 +572,20 @@ fn dedup_and_quantise(
     let (mut scans, mut tofs, mut ints) = (Vec::new(), Vec::new(), Vec::new());
     for (key, v) in summed {
         let (scan, tof) = ((key >> 32) as u32, key as u32);
-        let scaled = v * scale;
-        if scaled >= CEIL
+        // Add + consume any co-located background so a shared (scan, tof) bin isn't emitted twice. The
+        // quantised value is the COMBINED synthetic+background count, so saturation is checked on it (a bin
+        // below the ceiling in signal can cross it after real background).
+        let combined = v * scale + noise_at.remove(&key).unwrap_or(0.0);
+        if combined >= CEIL
             && !SATURATION_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             eprintln!(
-                "  WARNING: intensity saturated a u32 bin (scaled {:.3e} >= {:.3e}) — --intensity-scale \
-                 is too high for the most abundant ion; top of the dynamic range is being clipped",
-                scaled, CEIL
+                "  WARNING: intensity saturated a u32 bin (combined {:.3e} >= {:.3e}) — --intensity-scale \
+                 is too high (or A2 background pushed a bin over); top of the dynamic range is being clipped",
+                combined, CEIL
             );
         }
-        // Add + consume any co-located background so a shared (scan, tof) bin isn't emitted twice.
-        let q = (scaled + noise_at.remove(&key).unwrap_or(0.0)).min(CEIL) as u32;
+        let q = combined.min(CEIL) as u32;
         if q < floor.max(1) {
             continue;
         }
@@ -642,11 +644,17 @@ fn build_frame_noise(
     let ds = TimsDataset::new("", ref_d, false, false);
     // Pools from the reference metadata: MS1 = precursor frames; MS2 = frames grouped by DIA window group.
     let meta = read_meta_data_sql(ref_d).map_err(|e| anyhow!("A2: read frame meta: {e}"))?;
-    let ms1_pool: Vec<u32> = meta.iter().filter(|m| m.ms_ms_type == 0).map(|m| m.id as u32).collect();
+    let mut ms1_pool: Vec<u32> = meta.iter().filter(|m| m.ms_ms_type == 0).map(|m| m.id as u32).collect();
     let info = read_dia_ms_ms_info(ref_d).map_err(|e| anyhow!("A2: read DiaFrameMsMsInfo: {e}"))?;
     let mut ms2_pools: HashMap<u32, Vec<u32>> = HashMap::new();
     for i in &info {
         ms2_pools.entry(i.window_group).or_default().push(i.frame_id);
+    }
+    // Sort the pools by frame id: the seeded pick selects a pool INDEX, so reproducibility requires a
+    // canonical pool order (the SQL reads carry no ORDER BY, so their row order is not guaranteed stable).
+    ms1_pool.sort_unstable();
+    for v in ms2_pools.values_mut() {
+        v.sort_unstable();
     }
 
     let mut cache: HashMap<u32, Vec<(u32, u32, f64)>> = HashMap::new();
