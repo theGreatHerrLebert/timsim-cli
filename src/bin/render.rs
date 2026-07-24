@@ -596,6 +596,13 @@ fn dedup_and_quantise(
     // Background-only bins (no synthetic signal at that (scan, tof)).
     for (key, c) in noise_at {
         let (scan, tof) = ((key >> 32) as u32, key as u32);
+        if c >= CEIL && !SATURATION_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "  WARNING: A2 background saturated a u32 bin (combined {:.3e} >= {:.3e}) — \
+                 --noise-intensity-max is implausibly high; top of the range is being clipped",
+                c, CEIL
+            );
+        }
         let q = c.min(CEIL) as u32;
         if q < floor.max(1) {
             continue;
