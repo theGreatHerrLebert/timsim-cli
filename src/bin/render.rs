@@ -766,6 +766,7 @@ fn build_frame_noise(
 /// Validates the reference frame ids are contiguous `1..=n_frames` so `get_frame(f)` is the real f-th frame.
 fn build_spike_frames(
     ref_d: &str,
+    sched: &timsim_cli::dia::DiaSchedule,
     n_frames: u32,
     n_scans: u32,
     tof_max: u32,
@@ -773,13 +774,25 @@ fn build_spike_frames(
     use ms_io::data::dataset::TimsDataset;
     let ds = TimsDataset::new("", ref_d, false, false);
     let meta = read_meta_data_sql(ref_d).map_err(|e| anyhow!("spike: read frame meta: {e}"))?;
-    let ids: std::collections::HashSet<u32> = meta.iter().map(|m| m.id as u32).collect();
+    // Validate the run is regular: contiguous ids 1..=N and every real frame's MS type matches the
+    // schedule's replayed level for that frame (else the copied real peaks would land in a frame the output
+    // mislabels — spike needs the real per-frame sequence, not just a matching cycle). MS type: 0 = MS1.
+    let real_ms: HashMap<u32, i64> = meta.iter().map(|m| (m.id as u32, m.ms_ms_type)).collect();
     for f in 1..=n_frames {
-        if !ids.contains(&f) {
-            return Err(anyhow!(
-                "--spike-into: reference frame ids are not contiguous 1..={n_frames} (missing {f}) — \
-                 an irregular run is out of scope"
-            ));
+        match real_ms.get(&f) {
+            None => return Err(anyhow!(
+                "--spike-into: reference frame ids are not contiguous 1..={n_frames} (missing {f})"
+            )),
+            Some(&t) => {
+                let real_is_ms1 = t == 0;
+                let sched_is_ms1 = sched.ms_level(f) == 1;
+                if real_is_ms1 != sched_is_ms1 {
+                    return Err(anyhow!(
+                        "--spike-into: irregular run — real frame {f} MS type (ms_ms_type={t}) disagrees \
+                         with the schedule's replayed level; spike needs a regular DIA run"
+                    ));
+                }
+            }
         }
     }
     let mut frame_noise: HashMap<u32, Vec<(u32, u32, f64)>> = HashMap::with_capacity(n_frames as usize);
@@ -1227,12 +1240,9 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         return Err(anyhow!("--noise-only requires --noise-real-data or --spike-into (it renders the background alone)"));
     }
     let frame_noise: HashMap<u32, Vec<(u32, u32, f64)>> = if let Some(spike) = a.spike_into.as_ref() {
-        // Spike-into needs the schedule's replayed MS1/MS2 cycle to match the real run's actual sequence;
-        // guard the common failure (a run not starting on an MS1 frame). Full 1:1 was enforced in main().
-        if sched.ms_level(1) != 1 {
-            return Err(anyhow!("--spike-into needs a regular DIA run starting with an MS1 frame"));
-        }
-        build_spike_frames(spike.to_str().unwrap(), a.n_frames, p.n_scans, p.tof_max)?
+        // Full 1:1 frame count enforced in main(); build_spike_frames validates contiguity + per-frame
+        // MS-type agreement with the replayed schedule (a regular DIA run).
+        build_spike_frames(spike.to_str().unwrap(), &sched, a.n_frames, p.n_scans, p.tof_max)?
     } else if a.noise_real_data {
         let fn_map = build_frame_noise(
             ref_d.to_str().unwrap(), &sched, a.n_frames, p.n_scans, p.tof_max, a.noise_seed,
