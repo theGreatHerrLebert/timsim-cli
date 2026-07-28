@@ -37,6 +37,14 @@ struct Args {
     schema: bool,
 }
 
+/// The first few of a list, with a count when there are more. A 2,400-entry line helps nobody.
+fn preview(v: &[String]) -> String {
+    if v.len() <= 8 {
+        return v.join(", ");
+    }
+    format!("{}, ... (+{} more)", v[..8].join(", "), v.len() - 8)
+}
+
 fn main() -> Result<()> {
     let a = Args::parse();
     if a.schema {
@@ -110,6 +118,12 @@ fn main() -> Result<()> {
         Arc::new(Float32Array::from(d.protein_quantities.iter()
             .map(|q| if q.true_log2fc.is_finite() { Some(q.true_log2fc as f32) } else { None })
             .collect::<Vec<Option<f32>>>())),
+        // The REQUESTED intervention, alongside the REALISED one. Renormalising to a fixed load
+        // moves every protein, so a declared +1.0 comes out at ~+0.94 and the distortion differs
+        // per protein — the answer key must not conflate what was asked for with what happened.
+        Arc::new(Float32Array::from(d.protein_quantities.iter()
+            .map(|q| q.requested_log2fc.map(|v| v as f32))
+            .collect::<Vec<Option<f32>>>())),
         Arc::new(BooleanArray::from(d.protein_quantities.iter().map(|q| q.is_regulated).collect::<Vec<_>>())),
     ])?, &producer("timsim-design"), None)?;
 
@@ -130,6 +144,16 @@ fn main() -> Result<()> {
         println!("                         amounts are identical and all its variation is measured");
     }
     println!("  runs    (injections) : {}", d.runs.len());
+    if !d.report.forced_present.is_empty() {
+        println!();
+        println!("  regulated, forced into the sample : {} (n_proteins excluded them; naming a",
+                 d.report.forced_present.len());
+        println!("                                     protein in `regulate` is a statement that");
+        println!("                                     the experiment is about it)");
+        println!("    forced    : {}", preview(&d.report.forced_present));
+        println!("    displaced : {}   <- lowest-ranked, so the count stays exactly n_proteins",
+                 preview(&d.report.displaced));
+    }
     if !d.report.skipped_proteins.is_empty() {
         eprintln!("  warning: {} proteins skipped (non-standard residues; we refuse to guess a mass)",
                   d.report.skipped_proteins.len());

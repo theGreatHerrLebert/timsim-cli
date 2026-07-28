@@ -29,8 +29,12 @@ name = "timsim-yield"
 path = "src/bin/yield.rs"
 
 [dependencies]
-timsim-chem = "0.1.0"
-timsim-schema = "0.1.0"
+# The chemistry core and the schema contract. 0.2.0 adds per-protein `regulate` magnitudes,
+# regulated-implies-present forcing, and the `requested_log2fc` column. Working on them and this
+# repo at the same time? Put a [patch.crates-io] in a git-ignored `.cargo/config.toml` here — never
+# in this manifest, or a clone without the sibling checkout stops building.
+timsim-chem = "0.2.0"
+timsim-schema = "0.2.0"
 arrow = "56"
 parquet = "56"
 clap = { version = "4", features = ["derive"] }

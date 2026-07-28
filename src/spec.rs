@@ -105,21 +105,155 @@ pub struct ConditionSpec {
     pub replicates: u32,
     #[serde(default = "one")]
     pub technical_replicates: u32,
+    /// One regulation block, or a **list** of them. Hand-parsed (§`parse_regulate`) rather than
+    /// deserialised into an untagged enum: an untagged enum discards the inner error and reports
+    /// only *"data did not match any variant"*, which for a 14-protein map is unusable.
     #[serde(default)]
-    pub regulate: Option<RegulateSpec>,
+    pub regulate: Option<toml::Value>,
 }
 
 fn one() -> u32 {
     1
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum RegulateSpec {
-    /// A named set moved by a known amount — for reproducing a published benchmark.
-    Explicit { proteins: Vec<String>, log2fc: f64 },
-    /// A random fraction moved by a draw — for power analysis.
-    Generative { fraction: f64, log2fc_sd: f64 },
+/// Parse `[[condition]].regulate` into regulation blocks.
+///
+/// # The canonical form — a LIST of TAGGED blocks
+///
+/// ```toml
+/// regulate = [
+///   { kind = "explicit", proteins = { P0DJI8 = 1.6, P02741 = 1.4, P17540 = 0.7 } },
+///   { kind = "generative", fraction = 0.05, log2fc_sd = 1.0 },
+/// ]
+/// ```
+///
+/// Each named protein carries **its own** log2 fold change, because a real signature does not
+/// move every member by the same amount — and a benchmark that collapses them makes a volcano
+/// rank the planted set by noise instead of by effect size.
+///
+/// A single block may be written without the surrounding list. And because a TOML **inline table
+/// may not span lines**, a set of any size wants the array-of-tables spelling instead — same data
+/// model, one accession per line, so each can carry a comment:
+///
+/// ```toml
+/// [[condition.regulate]]
+/// kind = "explicit"
+/// [condition.regulate.proteins]
+/// P0DJI8 = 1.6   # SAA1
+/// P17540 = 0.7   # CKMT2
+/// ```
+///
+/// # The deprecated scalar form
+///
+/// ```toml
+/// regulate = { proteins = ["P0DJI8", "P02741"], log2fc = 1.0 }
+/// ```
+///
+/// Still accepted, because published configs are written this way — but it warns, and only the
+/// tagged form is documented and emitted.
+fn parse_regulate(cond: &str, v: &toml::Value) -> Result<Vec<design::Regulation>> {
+    let blocks: Vec<&toml::Value> = match v {
+        toml::Value::Array(a) => a.iter().collect(),
+        toml::Value::Table(_) => vec![v],
+        other => bail!(
+            "condition {cond:?}: `regulate` must be a block or a list of blocks, got {other}"
+        ),
+    };
+
+    let mut out = Vec::new();
+    for b in blocks {
+        let t = b.as_table().ok_or_else(|| {
+            anyhow::anyhow!("condition {cond:?}: each `regulate` entry must be a table, got {b}")
+        })?;
+
+        // A number that TOML happened to write as an integer is still a fold change.
+        let num = |k: &str| -> Result<f64> {
+            match t.get(k) {
+                Some(toml::Value::Float(x)) => Ok(*x),
+                Some(toml::Value::Integer(x)) => Ok(*x as f64),
+                Some(other) => bail!("condition {cond:?}: `regulate.{k}` must be a number, got {other}"),
+                None => bail!("condition {cond:?}: `regulate` block is missing `{k}`"),
+            }
+        };
+
+        match t.get("kind").and_then(|k| k.as_str()) {
+            Some("explicit") => {
+                let ps = t.get("proteins").ok_or_else(|| {
+                    anyhow::anyhow!("condition {cond:?}: an explicit block needs `proteins`")
+                })?;
+                let map = ps.as_table().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "condition {cond:?}: `proteins` in an explicit block is a MAP of \
+                         accession -> log2fc, e.g. {{ P0DJI8 = 1.6, P17540 = 0.7 }} — a bare list \
+                         has no per-protein magnitude, which is the point of this form"
+                    )
+                })?;
+                let mut proteins = BTreeMap::new();
+                for (id, fc) in map {
+                    let fc = match fc {
+                        toml::Value::Float(x) => *x,
+                        toml::Value::Integer(x) => *x as f64,
+                        other => bail!(
+                            "condition {cond:?}: log2fc for {id:?} must be a number, got {other}"
+                        ),
+                    };
+                    proteins.insert(id.clone(), fc);
+                }
+                if proteins.is_empty() {
+                    bail!("condition {cond:?}: an explicit `regulate` block names no proteins");
+                }
+                out.push(design::Regulation::Explicit { proteins });
+            }
+            Some("generative") => out.push(design::Regulation::Generative {
+                fraction: num("fraction")?,
+                log2fc_sd: num("log2fc_sd")?,
+            }),
+            Some(other) => bail!(
+                "condition {cond:?}: unknown regulate kind {other:?} — expected \"explicit\" or \
+                 \"generative\""
+            ),
+            // ── DEPRECATED compatibility paths, kept so published configs keep working ──
+            None if t.contains_key("proteins") => {
+                let list = t["proteins"].as_array().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "condition {cond:?}: the deprecated scalar `regulate` form takes \
+                         `proteins = [...]` and one `log2fc`; for per-protein magnitudes use \
+                         `{{ kind = \"explicit\", proteins = {{ ACC = 1.6, ... }} }}`"
+                    )
+                })?;
+                let log2fc = num("log2fc")?;
+                eprintln!(
+                    "  warning: condition {cond:?}: `regulate = {{ proteins = [...], log2fc = ... }}` \
+                     is deprecated — it gives every protein the SAME magnitude. Use \
+                     `regulate = [{{ kind = \"explicit\", proteins = {{ ACC = <log2fc>, ... }} }}]`"
+                );
+                let mut proteins = BTreeMap::new();
+                for id in list {
+                    let id = id.as_str().ok_or_else(|| {
+                        anyhow::anyhow!("condition {cond:?}: `proteins` must be accession strings")
+                    })?;
+                    if proteins.insert(id.to_string(), log2fc).is_some() {
+                        bail!("condition {cond:?}: protein {id:?} is listed twice in `regulate`");
+                    }
+                }
+                if proteins.is_empty() {
+                    bail!("condition {cond:?}: `regulate` names no proteins");
+                }
+                out.push(design::Regulation::Explicit { proteins });
+            }
+            None if t.contains_key("fraction") || t.contains_key("log2fc_sd") => {
+                out.push(design::Regulation::Generative {
+                    fraction: num("fraction")?,
+                    log2fc_sd: num("log2fc_sd")?,
+                });
+            }
+            None => bail!(
+                "condition {cond:?}: a `regulate` block needs `kind = \"explicit\"` (with a \
+                 `proteins` map) or `kind = \"generative\"` (with `fraction` and `log2fc_sd`)"
+            ),
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -212,19 +346,10 @@ pub fn load_design(path: &Path, abundance_dir: &Path) -> Result<design::DesignSp
             mix,
             replicates: c.replicates,
             technical_replicates: c.technical_replicates,
-            regulate: c.regulate.as_ref().map(|r| match r {
-                RegulateSpec::Explicit { proteins, log2fc } => design::Regulation::Explicit {
-                    proteins: proteins.clone(),
-                    log2fc: *log2fc,
-                },
-                RegulateSpec::Generative {
-                    fraction,
-                    log2fc_sd,
-                } => design::Regulation::Generative {
-                    fraction: *fraction,
-                    log2fc_sd: *log2fc_sd,
-                },
-            }),
+            regulate: match &c.regulate {
+                Some(v) => parse_regulate(&c.name, v)?,
+                None => Vec::new(),
+            },
         });
     }
 
@@ -241,4 +366,93 @@ pub fn load_design(path: &Path, abundance_dir: &Path) -> Result<design::DesignSp
         },
         seed: f.design.seed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reg(toml_src: &str) -> Result<Vec<design::Regulation>> {
+        let v: toml::Value = toml::from_str(toml_src).unwrap();
+        parse_regulate("severe", &v["regulate"])
+    }
+
+    fn explicit(r: &design::Regulation) -> &BTreeMap<String, f64> {
+        match r {
+            design::Regulation::Explicit { proteins } => proteins,
+            other => panic!("expected an explicit block, got {other:?}"),
+        }
+    }
+
+    /// THE canonical form: a list of tagged blocks, the explicit one carrying a per-protein map.
+    /// This is what makes a benchmark's authored 0.5–1.8 spread survive into the answer key
+    /// instead of collapsing to one number.
+    #[test]
+    fn a_list_of_tagged_blocks_keeps_per_protein_magnitudes() {
+        let rs = reg(
+            r#"
+            regulate = [
+              { kind = "explicit", proteins = { P0DJI8 = 1.6, P02741 = 1.4, P17540 = 0.7 } },
+              { kind = "generative", fraction = 0.05, log2fc_sd = 1.0 },
+            ]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 2);
+        let m = explicit(&rs[0]);
+        assert_eq!(m["P0DJI8"], 1.6);
+        assert_eq!(m["P02741"], 1.4);
+        assert_eq!(m["P17540"], 0.7);
+        match &rs[1] {
+            design::Regulation::Generative { fraction, log2fc_sd } => {
+                assert_eq!((*fraction, *log2fc_sd), (0.05, 1.0));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A single block needs no surrounding list.
+    #[test]
+    fn one_tagged_block_without_a_list_is_accepted() {
+        let rs = reg(r#"regulate = { kind = "explicit", proteins = { P0DJI8 = 2 } }"#).unwrap();
+        assert_eq!(explicit(&rs[0])["P0DJI8"], 2.0); // an integer is still a fold change
+    }
+
+    /// BACKWARDS COMPATIBILITY. The deprecated scalar form still parses, and still means
+    /// "one magnitude for the whole set".
+    #[test]
+    fn the_deprecated_scalar_form_still_works() {
+        let rs = reg(r#"regulate = { proteins = ["P0DJI8", "P02741"], log2fc = 1.0 }"#).unwrap();
+        assert_eq!(rs.len(), 1);
+        let m = explicit(&rs[0]);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["P0DJI8"], 1.0);
+        assert_eq!(m["P02741"], 1.0);
+
+        // …and so does the untagged generative form.
+        let rs = reg(r#"regulate = { fraction = 0.05, log2fc_sd = 1.0 }"#).unwrap();
+        assert!(matches!(rs[0], design::Regulation::Generative { .. }));
+    }
+
+    /// The old untagged enum reported only *"data did not match any variant of untagged enum
+    /// RegulateSpec"*, which for a 14-protein map is unusable. Every rejection must name what
+    /// was wrong.
+    #[test]
+    fn malformed_blocks_are_rejected_with_a_usable_message() {
+        // `kind = "explicit"` with a bare list — the form that has no per-protein magnitude.
+        let e = reg(r#"regulate = { kind = "explicit", proteins = ["P0DJI8"] }"#).unwrap_err();
+        assert!(format!("{e}").contains("MAP"), "{e}");
+
+        let e = reg(r#"regulate = [{ kind = "sideways", proteins = { A = 1 } }]"#).unwrap_err();
+        assert!(format!("{e}").contains("sideways"), "{e}");
+
+        let e = reg(r#"regulate = { log2fc = 1.0 }"#).unwrap_err();
+        assert!(format!("{e}").contains("severe"), "{e}");
+
+        let e = reg(r#"regulate = { kind = "generative", fraction = 0.05 }"#).unwrap_err();
+        assert!(format!("{e}").contains("log2fc_sd"), "{e}");
+
+        assert!(reg(r#"regulate = "everything""#).is_err());
+        assert!(reg(r#"regulate = { kind = "explicit", proteins = {} }"#).is_err());
+    }
 }

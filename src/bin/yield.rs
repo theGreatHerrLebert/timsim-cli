@@ -225,14 +225,74 @@ fn main() -> Result<()> {
 
     // protein amounts, per sample
     let mut amounts: HashMap<String, HashMap<String, f64>> = HashMap::new(); // sample -> protein -> amol
+    // The answer key's regulated set, unioned over conditions — for the observability report below.
+    let mut regulated: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for b in timsim_schema::read(&pq_p, PRQ::TABLE)? {
         let (pr, sa) = (col_str(&b, PRQ::PROTEIN_ID), col_str(&b, PRQ::SAMPLE_ID));
         let am = col_f64(&b, PRQ::AMOUNT_AMOL);
+        let is_reg: &arrow::array::BooleanArray = b
+            .column_by_name(PRQ::IS_REGULATED).unwrap().as_any().downcast_ref().unwrap();
         for i in 0..b.num_rows() {
             amounts
                 .entry(sa.value(i).to_string())
                 .or_default()
                 .insert(pr.value(i).to_string(), am.value(i));
+            if is_reg.value(i) {
+                regulated.insert(pr.value(i).to_string());
+            }
+        }
+    }
+
+    // ── ANSWER-KEY OBSERVABILITY ─────────────────────────────────────────────
+    //
+    // `timsim-digest --max-peptides` samples the digest UNIFORMLY, and that must stay unbiased:
+    // making the sample regulation-aware would bias the digest, a worse failure than the one it
+    // would fix. But a regulated protein holding a few thousandths of the peptide space can lose
+    // EVERY peptide to that sample — and then a DE analysis is scored against an effect that is
+    // physically unobservable, silently. A cohort must be judgeable as scoreable *before* it is
+    // searched, so the surviving peptide count per regulated protein is recorded here, where the
+    // (already subsampled) structure and the answer key first meet.
+    let mut regulated_peptides: Vec<(String, usize)> = regulated
+        .iter()
+        .map(|p| {
+            let n = occs
+                .get(p)
+                .map(|v| {
+                    v.iter()
+                        .filter_map(|o| occ_pid.get(&(p.clone(), o.start, o.end)))
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                })
+                .unwrap_or(0);
+            (p.clone(), n)
+        })
+        .collect();
+    regulated_peptides.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let unobservable: Vec<&str> = regulated_peptides
+        .iter()
+        .filter(|(_, n)| *n == 0)
+        .map(|(p, _)| p.as_str())
+        .collect();
+    if !regulated.is_empty() {
+        let total: usize = regulated_peptides.iter().map(|(_, n)| n).sum();
+        println!("  regulated proteins   : {} in the answer key, {total} surviving peptides between them",
+                 regulated.len());
+        println!("    fewest / most      : {} / {}",
+                 regulated_peptides.first().map(|(_, n)| *n).unwrap_or(0),
+                 regulated_peptides.last().map(|(_, n)| *n).unwrap_or(0));
+        if !unobservable.is_empty() {
+            eprintln!(
+                "  warning: {} of {} regulated proteins have NO surviving peptides — their planted \
+                 effect is UNOBSERVABLE and no DE analysis can recover it. This is what a small \
+                 `timsim-digest --max-peptides` does: it samples the digest uniformly (correctly — a \
+                 regulation-aware sample would bias the digest), so a protein holding a thousandth \
+                 of the peptide space usually keeps none of it. Raise or remove the cap.",
+                unobservable.len(), regulated.len());
+            eprintln!("           {}{}",
+                      unobservable.iter().take(12).cloned().collect::<Vec<_>>().join(", "),
+                      if unobservable.len() > 12 {
+                          format!(", ... (+{} more)", unobservable.len() - 12)
+                      } else { String::new() });
         }
     }
 
@@ -399,6 +459,15 @@ fn main() -> Result<()> {
         t.push_str("[missed_cleavages]\n");
         for (i, f) in dist.iter().enumerate() {
             t.push_str(&format!("\"{i}\" = {f:.6}\n"));
+        }
+        // Per-regulated-protein peptide counts: the machine-readable half of the observability
+        // report, so a cohort can be gated on "is the planted effect observable at all?" without
+        // parsing stdout.
+        if !regulated_peptides.is_empty() {
+            t.push_str("\n[regulated_peptides]\n");
+            for (p, n) in &regulated_peptides {
+                t.push_str(&format!("\"{p}\" = {n}\n"));
+            }
         }
         std::fs::write(&rp, t)?;
         println!("  report               -> {}", rp.display());
