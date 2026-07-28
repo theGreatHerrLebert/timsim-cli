@@ -136,7 +136,8 @@ struct Args {
     /// envelope**, matching v1's convention (`precursor_noise_ppm`, default 5.0): in the default Gaussian
     /// mode the actual standard deviation is `mz·ppm/1e6/3` (ppm = 3σ), reproducing v1's
     /// `add_mz_noise_normal`. `0` = off (byte-identical to the noiseless render). Seeded per
-    /// `(precursor_id, peak_index)` so adding an ion never reshuffles the others. See `REALISM_PLAN.md`.
+    /// `(precursor_id, peak_index)` so adding an ion never reshuffles the others. See `REALISM_PLAN.md`
+    /// in the timsim-necro repo (github.com/theGreatHerrLebert/timsim-necro), where the noise plan lives.
     #[arg(long, default_value_t = 0.0)]
     noise_mz_ppm: f64,
     /// Noise A1 — m/z scatter on **fragment (MS2)** peaks (ppm envelope, v1 `fragment_noise_ppm`). `0` = off.
@@ -156,7 +157,8 @@ struct Args {
     /// matching type (MS1, or MS2 of the same DIA window group), keep real peaks with intensity in
     /// `[1, --noise-intensity-max]`, downsample each by the take-fraction, and add (real detector counts) on
     /// top of the synthetic signal. Bruker DIA only. `off` (default) = byte-identical noiseless render.
-    /// Seeded (deterministic) — v1 uses a thread RNG; we match the distribution, not the bytes. REALISM_PLAN.
+    /// Seeded (deterministic) — v1 uses a thread RNG; we match the distribution, not the bytes.
+    /// (Plan: `REALISM_PLAN.md` in the timsim-necro repo.)
     #[arg(long, default_value_t = false)]
     noise_real_data: bool,
     /// A2: reference MS1 frames sampled per output precursor frame (v1 `num_precursor_noise_frames`).
@@ -178,7 +180,7 @@ struct Args {
     /// A2 background control (also spike-into control): deposit ONLY the real-data background / real frames
     /// (skip the synthetic signal), so a search of this `.d` yields the real IDs to subtract from FDP. Run
     /// at the same seed as the real render, then pass its DiaNN report to the scorer's `--background-report`.
-    /// Requires `--noise-real-data` OR `--spike-into`. See REALISM_PLAN.md.
+    /// Requires `--noise-real-data` OR `--spike-into`. (Plan: `REALISM_PLAN.md` in the timsim-necro repo.)
     #[arg(long, default_value_t = false)]
     noise_only: bool,
     /// Spike-into-real (mode B): overlay the synthetic signal **additively onto a REAL `.d`** instead of a

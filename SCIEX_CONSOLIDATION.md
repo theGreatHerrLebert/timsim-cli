@@ -1,6 +1,13 @@
 # SCIEX → NECRO consolidation + HeLa-driven iteration
 
-Status: DRAFT for claudex. Goal: stop debugging SCIEX across three divergent rustims checkouts +
+Status: **LANDED** — kept as the investigation record. All three stages closed (see the Stage-1 RESULT
+/ Decision point / Stage-3 DONE sections below). The lean open-mzML path ships in this repo as
+`src/bin/render_sciex.rs` (`timsim-render-sciex`, behind the `sciex` cargo feature — no `sciexwiff`,
+no `ms-io`) and is wired as a necroflow node; the native `.wiff` writer's root cause (missing 0xff
+terminator + wrong padding) was found and fixed in the rustims-local satellite, after which both paths
+search identically (444 vs 449 protein groups on the same seed).
+
+Original goal: stop debugging SCIEX across three divergent rustims checkouts +
 a broken covid-in-hela seed. Move the good SCIEX code into the necroflow v2 branch
 (`feat/timsim-v2-structure-axis`) and iterate against our own **dense HeLa** harness — exactly the
 approach that made the Thermo `.raw` track tractable.

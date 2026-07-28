@@ -1,6 +1,13 @@
 # NECROFLOW_WIRING — wire the measurement/render stage into the timsim2 DAG
 
-Status: DRAFT for claudex. Goal: everything we built this session (Koina HCD fragments, `timsim-spectra`,
+Status: **LANDED (Thermo branch), with named follow-ups** — see the "Progress log (build)" section
+below for what shipped and what is still open. The Thermo path is real DAG nodes
+(`frag_input → fragments → spectra → render_thermo`, plus opt-in `search` + `score`), verified end to
+end on a HeLa-basic config. Still open: **#2** `AcquisitionMethod` as typed config, and decomposing
+the Bruker `simulate` node into `fragments → spectra → render_bruker` (with the per-precursor
+mobility-CE landmine noted there).
+
+Original goal: everything we built this session (Koina HCD fragments, `timsim-spectra`,
 `timsim-render-thermo`, per-instrument templates, the device×method matrix) becomes reproducible
 **necroflow nodes**, so we stop hand-firing steps and the whole matrix is content-addressed.
 
@@ -162,8 +169,10 @@ milestone first); GUI/CLI changes beyond the flow.
   template validation before the sweep — done (595768e8). **#9** one `IonSpectra` node — done.
 
 **Remaining:**
-- **#3** explicit `FragmentPredictionInput` node (freeze precursor_id/sequence/charge + **mod encoding** —
-  today fragments predicts on the BARE peptide sequence, wrong for modified precursors). Correctness + structure.
+- ~~**#3** explicit `FragmentPredictionInput` node (freeze precursor_id/sequence/charge + **mod encoding** —
+  today fragments predicts on the BARE peptide sequence, wrong for modified precursors)~~ — DONE:
+  `timsim-frag-input` (`src/bin/frag_input.rs`) emits the `[UNIMOD]`-annotated sequence + charge via the
+  same `annotate()` the spectrum builder uses, and the flow's `frag_input` node feeds `fragments`.
 - **#2** `AcquisitionMethod` as typed config (drives windows/timing/selection/CE) — matters most for DDA.
 - ~~**#8** validate CE against template-extracted NCE~~ — DONE: render extracts the template's median MS2
   NCE and warns if --expected-ce differs >15%; manifest records template_nce + fragment_ce. (Orbi DIA

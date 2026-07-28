@@ -1,6 +1,11 @@
 # THERMO_PLAN — non-IMS Thermo Astral `.raw` generation from the v2 feature space
 
-Status: DRAFT for claudex review. Companion to `DDA_PLAN.md` (timsTOF DDA, done).
+Status: **IMPLEMENTED** — M0–M3 landed; this is the design record, not a proposal. The driver is
+`src/bin/render_thermo.rs` (`timsim-render-thermo`, behind the `thermo` cargo feature), authoring
+through `timsim-core`'s `acquisition::{ScanDescriptor, ThermoRawWriter}` seam, and the necroflow DAG
+runs `frag_input → fragments → spectra → render_thermo → search → score` end to end (see
+`NECROFLOW_WIRING.md`). Items below still marked "open question" / "non-goal" remain open.
+Companion to `DDA_PLAN.md` (timsTOF DDA, also landed).
 
 ## Goal & why
 

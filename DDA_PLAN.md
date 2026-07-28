@@ -1,5 +1,13 @@
 # DDA-PASEF render — plan (grounded in the working v1 code + two domain reviews)
 
+Status: **IMPLEMENTED** — M1–M3 landed; this is the design record. The selection scheme is
+`src/dda.rs` (the v1 port), driven by `timsim-render --dda` (`run_dda` in `src/bin/render.rs`), which
+writes the `Precursors` + `PasefFrameMsMsInfo` tables into the `.d` and a sidecar per-selection-event
+answer key (`--dda-truth`, default `<out>.dda_selected.parquet`). Sage searches it and
+`timsim_eval.v2_dda_eval` scores it (conditional ID recall + FDP) as a necroflow node. The
+"oracle-isolation baseline" scope caveat at the end of this document still stands: true chimeric
+co-fragmentation, charge mis-assignment and MS1 feature-detection realism are NOT modelled.
+
 Goal: a first minimal-but-real **DDA-PASEF** render path for timsim v2 — a Bruker `.d` a native
 ddaPASEF search engine (Sage/FragPipe) can search, scorable by the eval harness against v2 answer keys.
 This revision folds in the **actual v1 implementation** (`jobs/dda_selection_scheme.py`, `tdf.py`
