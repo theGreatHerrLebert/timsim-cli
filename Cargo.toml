@@ -34,7 +34,7 @@ path = "src/bin/yield.rs"
 # repo at the same time? Put a [patch.crates-io] in a git-ignored `.cargo/config.toml` here — never
 # in this manifest, or a clone without the sibling checkout stops building.
 timsim-chem = "0.2.0"
-timsim-schema = "0.2.0"
+timsim-schema = "0.2.1"
 arrow = "56"
 parquet = "56"
 clap = { version = "4", features = ["derive"] }
