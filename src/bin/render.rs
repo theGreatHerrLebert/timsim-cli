@@ -126,9 +126,11 @@ struct Args {
     /// chunk-stitching (any N ≥ 1 must produce byte-identical output to N = 1).
     #[arg(long, default_value_t = 0)]
     render_chunks: u32,
-    /// DIA render: force the STREAMING single-threaded path (bounded to one chunk's ions), disabling the
-    /// resident multi-threaded fast path. The fast path is used by default when the ion set is estimated to
-    /// fit a memory budget; this forces streaming for huge uncapped datasets or byte-identity testing.
+    /// DIA render: force a FULLY SERIAL render — the streaming path (bounded to one chunk's ions) with no
+    /// threading at all, i.e. the byte-identity escape hatch. By default the render is multi-threaded on
+    /// both paths: resident-parallel when the ion set is estimated to fit a memory budget, otherwise
+    /// streaming chunks whose frame range is rendered in parallel (same encode + ordered-append machinery,
+    /// same bounded peak memory). Use `--render-chunks` alone to force streaming while keeping threads.
     #[arg(long, default_value_t = false)]
     no_parallel: bool,
     /// Noise A1 — m/z scatter on **precursor (MS1)** peaks, applied before m/z→tof so a search engine sees
@@ -1404,8 +1406,11 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         bounds
     };
     eprintln!(
-        "  streaming render: {} precursors in {} apex-chunk(s) (equal-ion) -> {}",
-        meta.len(), n_chunks, a.out.display()
+        "  streaming render: {} precursors in {} apex-chunk(s) (equal-ion), {} -> {}",
+        meta.len(), n_chunks,
+        if a.no_parallel { "serial".to_string() }
+        else { format!("{} threads within each chunk", rayon::current_num_threads()) },
+        a.out.display()
     );
 
     // Render + write, per-frame MsMsType.
@@ -1618,33 +1623,52 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         ions.sort_unstable_by_key(|x| x.0);
         let ions: Vec<DiaIon> = ions.into_iter().map(|x| x.1).collect();
 
-        let mut err: Result<()> = Ok(());
         let emit_all = !frame_noise.is_empty();
-        dia_render_range(&ions, &sched, g, fc0, fc1, emit_all, |frame, ms_type, tri| {
-            if err.is_err() {
-                return;
-            }
-            let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
-            let syn: &[(u32, u32, f64)] = if a.noise_only { &[] } else { tri };
-            let (scans, tofs, ints) = dedup_and_quantise(syn, a.intensity_scale, a.min_peak_intensity, fnoise);
-            if scans.is_empty() {
-                return; // truly-empty frame → leave a gap (filled empty by the next write / trailing loop)
-            }
-            while next_fid < frame {
-                if let Err(x) = write_frame(&mut writer, next_fid, gap_ms(next_fid), a.cycle_seconds, Vec::new(), Vec::new(), Vec::new()) {
+        if a.no_parallel {
+            // `--no-parallel`: fully serial, the byte-identity escape hatch. One `dia_render_range` sweep
+            // over the chunk, encoding and appending each frame inline via `write_frame`.
+            let mut err: Result<()> = Ok(());
+            dia_render_range(&ions, &sched, g, fc0, fc1, emit_all, |frame, ms_type, tri| {
+                if err.is_err() {
+                    return;
+                }
+                let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
+                let syn: &[(u32, u32, f64)] = if a.noise_only { &[] } else { tri };
+                let (scans, tofs, ints) = dedup_and_quantise(syn, a.intensity_scale, a.min_peak_intensity, fnoise);
+                if scans.is_empty() {
+                    return; // truly-empty frame → leave a gap (filled empty by the next write / trailing loop)
+                }
+                while next_fid < frame {
+                    if let Err(x) = write_frame(&mut writer, next_fid, gap_ms(next_fid), a.cycle_seconds, Vec::new(), Vec::new(), Vec::new()) {
+                        err = Err(x);
+                        return;
+                    }
+                    next_fid += 1;
+                }
+                if ms_type == 0 { ms1_peaks += scans.len() as u64 } else { ms2_peaks += scans.len() as u64 }
+                if let Err(x) = write_frame(&mut writer, frame, ms_type, a.cycle_seconds, scans, tofs, ints) {
                     err = Err(x);
                     return;
                 }
-                next_fid += 1;
-            }
-            if ms_type == 0 { ms1_peaks += scans.len() as u64 } else { ms2_peaks += scans.len() as u64 }
-            if let Err(x) = write_frame(&mut writer, frame, ms_type, a.cycle_seconds, scans, tofs, ints) {
-                err = Err(x);
-                return;
-            }
-            next_fid = frame + 1;
-        });
-        err?;
+                next_fid = frame + 1;
+            });
+            err?;
+        } else {
+            // Bounded-memory PARALLEL render of this chunk: the SAME parallel-encode + ordered-append
+            // machinery the resident fast path uses, applied to one chunk's frame range. Peak memory is
+            // still one chunk's active ions (the sub-ranges SHARE `&ions` — nothing is cloned).
+            render_range_parallel(
+                &mut writer, &ions, &sched, g, fc0, fc1, emit_all, &frame_noise,
+                &ParallelRenderCfg {
+                    n_scans: p.n_scans,
+                    intensity_scale: a.intensity_scale,
+                    min_peak_intensity: a.min_peak_intensity,
+                    noise_only: a.noise_only,
+                    cycle_seconds: a.cycle_seconds,
+                },
+                &mut next_fid, &mut ms1_peaks, &mut ms2_peaks,
+            )?;
+        }
     }
     }
     while next_fid <= a.n_frames {
@@ -1710,6 +1734,141 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
 
     if a.verify {
         verify(&a.out, p)?;
+    }
+    Ok(())
+}
+
+/// The scalar render knobs `render_range_parallel` needs. Bundled because the rayon closure must NOT
+/// capture `Args`/`Placement` — `Placement` holds boxed `to_tof`/`from_tof` closures that are not `Sync`.
+struct ParallelRenderCfg {
+    n_scans: u32,
+    intensity_scale: f64,
+    min_peak_intensity: u32,
+    noise_only: bool,
+    cycle_seconds: f64,
+}
+
+/// Render + encode frames `[frame_lo, frame_hi]` of `ions` ON THE RAYON POOL, then append the blocks to
+/// `writer` in frame order (filling gap frames exactly as the serial loop does). This is the bounded-memory
+/// path's parallel engine: the caller holds only ONE chunk's ions, and this splits that chunk's frame range
+/// across threads.
+///
+/// BYTE-IDENTICAL to the serial `dia_render_range` + `write_frame` loop over the same range, for the same
+/// reasons the resident fast path is:
+///   - `dia_render_range` restricted to a sub-range reproduces the exact per-frame active set (ions whose
+///     window opened before the sub-range are entered at its first frame) and visits it in original ion
+///     index order, so each frame's triple buffer is built in the same sequence — the f64 sums in
+///     `dedup_and_quantise` therefore match bit-for-bit;
+///   - `dedup_and_quantise` and `encode_frame_block` are pure, so a block does not depend on where in the
+///     file it lands;
+///   - `TdfWriter::write_frame` IS `encode_frame_block` + `append_encoded_frame`, and we append in the same
+///     ascending frame order, at the same compression level (1, bound to `TdfWriterConfig` by the caller).
+/// Unlike the fast path, the sub-ranges SHARE `&ions` instead of cloning a per-sub-range subset, so peak
+/// memory stays at one chunk's ions (a clone would multiply the chunk's peak vectors by the thread count).
+#[allow(clippy::too_many_arguments)]
+fn render_range_parallel(
+    writer: &mut TdfWriter,
+    ions: &[timsim_cli::ms2::DiaIon],
+    sched: &timsim_cli::dia::DiaSchedule,
+    g: &Geometry,
+    frame_lo: u32,
+    frame_hi: u32,
+    emit_all: bool,
+    frame_noise: &HashMap<u32, Vec<(u32, u32, f64)>>,
+    cfg: &ParallelRenderCfg,
+    next_fid: &mut u32,
+    ms1_peaks: &mut u64,
+    ms2_peaks: &mut u64,
+) -> Result<()> {
+    use rayon::prelude::*;
+    use timsim_cli::ms2::{active_frames, dia_render_range};
+    if frame_hi < frame_lo {
+        return Ok(());
+    }
+    let n_frames_here = frame_hi - frame_lo + 1;
+    let threads = rayon::current_num_threads().max(1);
+    // More sub-ranges than threads so rayon work-steals across the uneven elution density, at equal-ION
+    // quantiles of the chunk's own elution starts (equal-width slices would pile the work into one).
+    let pn = ((threads * 8) as u32).clamp(1, n_frames_here);
+    let pbounds: Vec<u32> = {
+        let mut starts: Vec<u32> = ions
+            .iter()
+            .map(|io| active_frames(io.apex_frame, g).0.max(frame_lo))
+            .collect();
+        starts.sort_unstable();
+        let mut b = Vec::with_capacity(pn as usize + 1);
+        b.push(frame_lo);
+        for c in 1..pn {
+            let mut f = if starts.is_empty() {
+                frame_lo + n_frames_here * c / pn
+            } else {
+                starts[(starts.len() * c as usize / pn as usize).min(starts.len() - 1)]
+            };
+            let prev = *b.last().unwrap();
+            f = f.max(prev + 1).min(frame_hi); // strictly increasing (pn <= n_frames_here leaves room)
+            b.push(f);
+        }
+        b.push(frame_hi + 1);
+        b
+    };
+
+    type ChunkOut = (Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)>, u64, u64);
+    let (n_scans, iscale, floor, noise_only) =
+        (cfg.n_scans, cfg.intensity_scale, cfg.min_peak_intensity, cfg.noise_only);
+    // Encoded blocks are the only thing that crosses the rayon boundary, and they are held only until the
+    // next append — process the sub-ranges in WAVES so at most half a chunk's compressed output is ever
+    // in flight (a chunk of a full-proteome run is ~90 MB of `.tdf_bin`, so this stays far under the ion
+    // budget), while still giving every thread several sub-ranges per wave to steal from.
+    let wave = ((threads * 4) as u32).clamp(1, pn) as usize;
+    let mut c0 = 0usize;
+    while c0 < pn as usize {
+        let c1 = (c0 + wave).min(pn as usize);
+        let waved: Vec<Result<ChunkOut, String>> = (c0..c1)
+            .into_par_iter()
+            .map(|c| {
+                let (f0, f1) = (pbounds[c], pbounds[c + 1] - 1);
+                if f1 < f0 {
+                    return Ok((Vec::new(), 0, 0));
+                }
+                let (mut cm1, mut cm2) = (0u64, 0u64);
+                let mut out: Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)> = Vec::new();
+                let mut err: Option<String> = None;
+                dia_render_range(ions, sched, g, f0, f1, emit_all, |frame, ms_type, tri| {
+                    if err.is_some() {
+                        return;
+                    }
+                    let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let syn: &[(u32, u32, f64)] = if noise_only { &[] } else { tri };
+                    let (scans, tofs, ints) = dedup_and_quantise(syn, iscale, floor, fnoise);
+                    if scans.is_empty() {
+                        return; // truly-empty frame → leave a gap (written empty on append)
+                    }
+                    if ms_type == 0 { cm1 += scans.len() as u64 } else { cm2 += scans.len() as u64 }
+                    match ms_io::data::tdf_writer::encode_frame_block(&scans, &tofs, &ints, n_scans, 1) {
+                        Ok(blk) => out.push((frame, ms_type, blk)),
+                        Err(e) => err = Some(e.to_string()),
+                    }
+                });
+                match err { Some(e) => Err(e), None => Ok((out, cm1, cm2)) }
+            })
+            .collect();
+        for sub in waved {
+            let (blocks, cm1, cm2) = sub.map_err(|e| anyhow!("{e}"))?;
+            *ms1_peaks += cm1;
+            *ms2_peaks += cm2;
+            for (frame, ms_type, blk) in blocks {
+                while *next_fid < frame {
+                    let gap = if sched.ms_level(*next_fid) == 1 { 0u8 } else { 9u8 };
+                    write_frame(writer, *next_fid, gap, cfg.cycle_seconds, Vec::new(), Vec::new(), Vec::new())?;
+                    *next_fid += 1;
+                }
+                writer
+                    .append_encoded_frame(frame, frame as f64 * cfg.cycle_seconds, ms_type, blk)
+                    .map_err(|e| anyhow!("{e}"))?;
+                *next_fid = frame + 1;
+            }
+        }
+        c0 = c1;
     }
     Ok(())
 }
