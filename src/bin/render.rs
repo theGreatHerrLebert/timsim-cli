@@ -229,6 +229,14 @@ struct Args {
     /// After writing, reopen the `.d` through the rustims reader and report what round-trips.
     #[arg(long, default_value_t = false)]
     verify: bool,
+    /// Skip the pre-flight memory guard. By default a DIA parallel render estimates its peak RSS from the
+    /// thread count and auto-reduces threads (or refuses outright) when it would not fit the machine's —
+    /// or the cgroup's — usable memory, because overcommitting does NOT fail cleanly here: it surfaces
+    /// hours in as `Parquet argument error: External: Data corruption detected`. Pass this if you know
+    /// better than the estimate; see `timsim_cli::memguard` for the model and its measurements. The guard
+    /// never touches the OUTPUT — it only chooses a thread count, which is output-neutral by design.
+    #[arg(long, default_value_t = false)]
+    no_memory_guard: bool,
 }
 
 /// The acquisition geometry + calibration used to place ions. Closures hide whether the calibration
@@ -337,6 +345,25 @@ fn main() -> Result<()> {
     let mut a = Args::parse();
     if !(a.intensity_scale.is_finite() && a.intensity_scale > 0.0) {
         return Err(anyhow!("--intensity-scale must be finite and > 0, got {}", a.intensity_scale));
+    }
+    // Pre-flight memory admission, BEFORE anything touches rayon (so `build_global` still owns the
+    // global pool). Only the DIA parallel render is modelled — that is where the measurements come
+    // from — and reducing the thread count cannot change the output, by the same purity argument that
+    // makes the parallel render byte-identical to the serial one in the first place.
+    if a.dia && !a.no_parallel && !a.no_memory_guard {
+        use timsim_cli::memguard::{admit, requested_threads, Admission};
+        let want = requested_threads();
+        match admit(want) {
+            Admission::Proceed => {}
+            Admission::Reduce { threads, message } => {
+                eprintln!("  {message}");
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build_global()
+                    .map_err(|e| anyhow!("memory guard could not set {threads} rayon threads: {e}"))?;
+            }
+            Admission::Refuse { message } => return Err(anyhow!("{message}")),
+        }
     }
     // --spike-into implies the reference geometry + calibration come from that same real run (1:1 frames).
     if let Some(spike) = a.spike_into.clone() {
@@ -585,31 +612,96 @@ impl std::hash::Hasher for FxHasher {
 }
 type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
 
+/// Reusable scratch for [`dedup_and_quantise_into`], owned by ONE render sweep (one sub-range, one
+/// thread) and cleared per frame. `clear()`/`drain()` keep the allocation, so a sub-range of hundreds of
+/// frames allocates its hash tables and output vectors once instead of once per frame — which matters
+/// because `threads * 8` sweeps run concurrently and the per-frame churn was landing squarely on
+/// glibc's dynamically-raised mmap threshold (freed blocks staying on the heap as fragmentation).
+///
+/// Reuse is byte-identity-safe: the per-key f64 sums are still accumulated in input-triple order, and the
+/// only thing a different table capacity changes is the DRAIN order of the output vectors — which
+/// `encode_frame_block` re-sorts by `(scan, tof)` and reduces with integer (u128/u64) arithmetic before
+/// any byte is written. The same argument already licensed swapping SipHash for `FxHasher`.
+#[derive(Default)]
+struct DedupBufs {
+    summed: HashMap<u64, f64, FxBuild>,
+    noise_at: HashMap<u64, f64, FxBuild>,
+    scans: Vec<u32>,
+    tofs: Vec<u32>,
+    ints: Vec<u32>,
+}
+
+/// Upper bound on the per-buffer capacity carried between frames (elements). At 8M bins that is ~128 MiB
+/// of hash table plus 3 x 32 MiB of output vectors, comfortably inside the ~1.75 GiB/thread the render
+/// budgets (see `timsim_cli::memguard`) — while one pathological frame is prevented from pinning its
+/// worst case for the rest of the sub-range, times every thread.
+const MAX_RETAINED_BINS: usize = 8 * 1024 * 1024;
+
+impl DedupBufs {
+    /// Empty every buffer for the next frame, dropping any that grew past [`MAX_RETAINED_BINS`].
+    fn reset(&mut self) {
+        if self.summed.capacity() > MAX_RETAINED_BINS {
+            self.summed = HashMap::default();
+        } else {
+            self.summed.clear();
+        }
+        if self.noise_at.capacity() > MAX_RETAINED_BINS {
+            self.noise_at = HashMap::default();
+        } else {
+            self.noise_at.clear();
+        }
+        for v in [&mut self.scans, &mut self.tofs, &mut self.ints] {
+            if v.capacity() > MAX_RETAINED_BINS {
+                *v = Vec::new();
+            } else {
+                v.clear();
+            }
+        }
+    }
+}
+
 /// Sum synthetic contributions per (scan, tof), scale to detector counts, and — for A2 — add real
 /// background counts from `noise` on top (already absolute counts, NOT scaled), exactly like v1's
 /// `frame + noise`. `noise` empty ⇒ byte-identical to the noiseless render.
+///
+/// Owning wrapper around [`dedup_and_quantise_into`] for the callers that need the vectors by value
+/// (the serial `write_frame` path, the DDA render). Hot loops should reuse a [`DedupBufs`] instead.
 fn dedup_and_quantise(
     triples: &[(u32, u32, f64)],
     scale: f64,
     floor: u32,
     noise: &[(u32, u32, f64)],
 ) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let mut b = DedupBufs::default();
+    dedup_and_quantise_into(&mut b, triples, scale, floor, noise);
+    (b.scans, b.tofs, b.ints)
+}
+
+/// [`dedup_and_quantise`] writing into caller-owned buffers. On return `bufs.scans/tofs/ints` hold this
+/// frame's peaks (previous contents discarded).
+fn dedup_and_quantise_into(
+    bufs: &mut DedupBufs,
+    triples: &[(u32, u32, f64)],
+    scale: f64,
+    floor: u32,
+    noise: &[(u32, u32, f64)],
+) {
     debug_assert!(scale.is_finite() && scale > 0.0, "intensity_scale must be finite and > 0");
     const CEIL: f64 = u32::MAX as f64;
+    bufs.reset();
+    // Split the borrows so the `summed` drain and the `noise_at` lookups below can run side by side.
+    let DedupBufs { summed, noise_at, scans, tofs, ints } = bufs;
     // Pack (scan, tof) into a single u64 key so one cheap u64 hash replaces the tuple's two-field SipHash.
-    let mut summed: HashMap<u64, f64, FxBuild> =
-        HashMap::with_capacity_and_hasher(triples.len(), Default::default());
+    summed.reserve(triples.len());
     for &(scan, tof, v) in triples {
         *summed.entry(((scan as u64) << 32) | tof as u64).or_insert(0.0) += v;
     }
     // A2 background: real detector counts keyed the same way, added AFTER the synthetic scale.
-    let mut noise_at: HashMap<u64, f64, FxBuild> =
-        HashMap::with_capacity_and_hasher(noise.len(), Default::default());
+    noise_at.reserve(noise.len());
     for &(scan, tof, c) in noise {
         *noise_at.entry(((scan as u64) << 32) | tof as u64).or_insert(0.0) += c;
     }
-    let (mut scans, mut tofs, mut ints) = (Vec::new(), Vec::new(), Vec::new());
-    for (key, v) in summed {
+    for (key, v) in summed.drain() {
         let (scan, tof) = ((key >> 32) as u32, key as u32);
         // Add + consume any co-located background so a shared (scan, tof) bin isn't emitted twice. The
         // quantised value is the COMBINED synthetic+background count, so saturation is checked on it (a bin
@@ -633,7 +725,7 @@ fn dedup_and_quantise(
         ints.push(q);
     }
     // Background-only bins (no synthetic signal at that (scan, tof)).
-    for (key, c) in noise_at {
+    for (key, c) in noise_at.drain() {
         let (scan, tof) = ((key >> 32) as u32, key as u32);
         if c >= CEIL && !SATURATION_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!(
@@ -653,7 +745,6 @@ fn dedup_and_quantise(
         tofs.push(tof);
         ints.push(q);
     }
-    (scans, tofs, ints)
 }
 
 /// A2 identity-keyed state for slot `s` (one of the `num_frames` sampled) of output frame `f`. Successive
@@ -1527,14 +1618,16 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             let (mut c1, mut c2) = (0u64, 0u64);
             let mut out: Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)> = Vec::new();
             let mut err: Option<String> = None;
+            // One scratch set per frame-chunk, reused across its frames (see `DedupBufs`).
+            let mut bufs = DedupBufs::default();
             dia_render_range(&subset, &sched, g, fc0, fc1, emit_all, |frame, ms_type, tri| {
                 if err.is_some() { return; }
                 let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
                 let syn: &[(u32, u32, f64)] = if noise_only { &[] } else { tri };
-                let (scans, tofs, ints) = dedup_and_quantise(syn, iscale, floor, fnoise);
-                if scans.is_empty() { return; } // truly-empty frame → leave a gap (written empty on append)
-                if ms_type == 0 { c1 += scans.len() as u64 } else { c2 += scans.len() as u64 }
-                match ms_io::data::tdf_writer::encode_frame_block(&scans, &tofs, &ints, n_scans, 1) {
+                dedup_and_quantise_into(&mut bufs, syn, iscale, floor, fnoise);
+                if bufs.scans.is_empty() { return; } // truly-empty frame → gap (written empty on append)
+                if ms_type == 0 { c1 += bufs.scans.len() as u64 } else { c2 += bufs.scans.len() as u64 }
+                match ms_io::data::tdf_writer::encode_frame_block(&bufs.scans, &bufs.tofs, &bufs.ints, n_scans, 1) {
                     Ok(blk) => out.push((frame, ms_type, blk)),
                     Err(e) => err = Some(e.to_string()),
                 }
@@ -1833,18 +1926,23 @@ fn render_range_parallel(
                 let (mut cm1, mut cm2) = (0u64, 0u64);
                 let mut out: Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)> = Vec::new();
                 let mut err: Option<String> = None;
+                // One scratch set per sub-range, reused across its frames (see `DedupBufs`). Together
+                // with the reused triples buffer inside `dia_render_range` this makes the per-frame
+                // allocation churn a per-SUB-RANGE cost — the render's hot loop stops handing the
+                // allocator millions of short-lived multi-megabyte blocks on every thread.
+                let mut bufs = DedupBufs::default();
                 dia_render_range(ions, sched, g, f0, f1, emit_all, |frame, ms_type, tri| {
                     if err.is_some() {
                         return;
                     }
                     let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
                     let syn: &[(u32, u32, f64)] = if noise_only { &[] } else { tri };
-                    let (scans, tofs, ints) = dedup_and_quantise(syn, iscale, floor, fnoise);
-                    if scans.is_empty() {
+                    dedup_and_quantise_into(&mut bufs, syn, iscale, floor, fnoise);
+                    if bufs.scans.is_empty() {
                         return; // truly-empty frame → leave a gap (written empty on append)
                     }
-                    if ms_type == 0 { cm1 += scans.len() as u64 } else { cm2 += scans.len() as u64 }
-                    match ms_io::data::tdf_writer::encode_frame_block(&scans, &tofs, &ints, n_scans, 1) {
+                    if ms_type == 0 { cm1 += bufs.scans.len() as u64 } else { cm2 += bufs.scans.len() as u64 }
+                    match ms_io::data::tdf_writer::encode_frame_block(&bufs.scans, &bufs.tofs, &bufs.ints, n_scans, 1) {
                         Ok(blk) => out.push((frame, ms_type, blk)),
                         Err(e) => err = Some(e.to_string()),
                     }

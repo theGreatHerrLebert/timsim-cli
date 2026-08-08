@@ -216,6 +216,12 @@ pub fn dia_render_range<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
     order.sort_unstable_by_key(|&i| windows[i].0);
     let mut cursor = 0usize;
     let mut active: Vec<usize> = Vec::new();
+    // ONE triples buffer for the whole range, cleared per frame: `Vec::clear` keeps the capacity, so the
+    // deposit loop allocates once per sub-range instead of once per frame (a busy MS2 frame pushes
+    // millions of triples, and the parallel render runs `threads * 8` of these sweeps). The buffer is
+    // handed to `emit` as a slice and never escapes, so reuse is invisible to the caller and the emitted
+    // CONTENTS are unchanged — byte-identity is untouched.
+    let mut buf: Vec<(u32, u32, f64)> = Vec::new();
 
     for frame in frame_lo..=frame_hi {
         // Enter ions whose window has opened.
@@ -237,7 +243,7 @@ pub fn dia_render_range<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
         }
         active.sort_unstable(); // visit in original-index order -> deterministic, frame-major-identical
         let f = frame as f64;
-        let mut buf: Vec<(u32, u32, f64)> = Vec::new();
+        buf.clear();
         for &idx in &active {
             let ion = &ions[idx];
             let ew = gauss_frac(f - 0.5, f + 0.5, ion.apex_frame, g.sigma_frames);
@@ -289,8 +295,20 @@ pub fn dia_render_range<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
         if emit_all || !buf.is_empty() {
             emit(frame, ms_type, &buf);
         }
+        // Bound what the reuse RETAINS. Without this, one pathological frame (an ion whose elution
+        // window spans the run, a dense mid-gradient MS2 frame) would pin its own worst-case capacity
+        // for the rest of the sub-range — times the thread count, since every thread runs its own
+        // sweep. Dropping the buffer costs one re-grow on the next frame and caps the retention.
+        if buf.capacity() > MAX_RETAINED_TRIPLES {
+            buf = Vec::new();
+        }
     }
 }
+
+/// Upper bound on the triples capacity carried between frames: 16M triples x 16 B = 256 MiB per sweep.
+/// Sized to sit well inside the ~1.75 GiB/thread the render is already budgeted for (see
+/// `timsim_cli::memguard`), while being far above any ordinary frame so the reuse actually pays off.
+const MAX_RETAINED_TRIPLES: usize = 16 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {

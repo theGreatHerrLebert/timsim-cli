@@ -21,6 +21,8 @@ use std::sync::Arc;
 #[cfg(feature = "tdf")]
 pub mod dia;
 pub mod dda;
+/// Pre-flight memory admission for the parallel render (cgroup/MemAvailable aware).
+pub mod memguard;
 /// MS2 (DIA fragment) emission + its independent conservation oracle.
 #[cfg(feature = "tdf")]
 pub mod ms2;
