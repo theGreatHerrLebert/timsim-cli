@@ -23,6 +23,10 @@ pub mod dia;
 pub mod dda;
 /// Pre-flight memory admission for the parallel render (cgroup/MemAvailable aware).
 pub mod memguard;
+/// Mobility-derived per-precursor collision energy (CCS → 1/K0 → scan → CE). Needs the `tdf`
+/// feature: the mobility calibration lives in ms-io and Mason-Schamp in mscore.
+#[cfg(feature = "tdf")]
+pub mod mobility_ce;
 /// MS2 (DIA fragment) emission + its independent conservation oracle.
 #[cfg(feature = "tdf")]
 pub mod ms2;
