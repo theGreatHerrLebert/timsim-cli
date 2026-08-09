@@ -179,18 +179,14 @@ fn erfc_nr(x: f64) -> f64 {
 /// which is scale-free, overflow-free, and reduces to the Gaussian CDF as `k -> 0`.
 #[inline]
 pub fn emg_cdf_std(z: f64, k: f64) -> f64 {
-    const SQRT2: f64 = std::f64::consts::SQRT_2;
-    let _ = SQRT2;
-    0.5 * (erfc_nr(-z / SQRT2) - emg_tail_term(z, k))
+    0.5 * (erfc_nr(-z / std::f64::consts::SQRT_2) - emg_tail_term(z, k))
 }
 
 /// Standardised EMG PDF (in `z`), up to the `1/sigma` Jacobian. Only used to locate the mode.
 #[inline]
 fn emg_pdf_std(z: f64, k: f64) -> f64 {
-    const SQRT2: f64 = std::f64::consts::SQRT_2;
-    // lambda*sigma = 1/k, and the prefactor lambda/2 is a constant in z — dropped, since only the
-    // ARGMAX is wanted.
-    let _ = SQRT2;
+    // The prefactor lambda/2 is a constant in z, so it is dropped: only the ARGMAX is wanted, and
+    // the peak-height normalisation in `elution_ordinate` divides it out anyway.
     emg_tail_term(z, k)
 }
 
