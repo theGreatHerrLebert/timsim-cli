@@ -139,7 +139,7 @@ fn emg_shape_metrics() {
     assert!((g_as - 1.0).abs() < 1e-6, "a Gaussian must be symmetric");
 
     for &k in &[0.25, V1_DEFAULT_EMG_K, 1.0, 2.0] {
-        let e = PeakShape::Emg(Emg::new(k, 3.0));
+        let e = PeakShape::emg(k, 3.0).unwrap();
         let (fwhm, _, asf) = metrics(&e);
         println!("emg k={k:.4}: FWHM {fwhm:.4} sigma, As(10%) {asf:.4}");
         assert!(fwhm > g_fwhm, "k={k}: tailing must widen the peak ({fwhm} <= {g_fwhm})");
@@ -162,7 +162,7 @@ fn emg_mode_offset_matches_v1_mu_inversion() {
         let k = 1.0 / (sigma * lambda);
         // v1: mu = apex - (mode offset). v2 must recover the same offset from k alone.
         let v1_offset_sigmas = (apex - mu) / sigma;
-        let v2_offset_sigmas = Emg::new(k, 3.0).mode_offset();
+        let v2_offset_sigmas = Emg::new(k, 3.0).expect("v1's fixture k must be a valid EMG").mode_offset();
         let d = (v1_offset_sigmas - v2_offset_sigmas).abs();
         println!(
             "peptide {} k={k:.4}: v1 mode offset {v1_offset_sigmas:.6} sigma, v2 {v2_offset_sigmas:.6} sigma, diff {d:.2e}",

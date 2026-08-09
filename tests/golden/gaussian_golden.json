@@ -1,0 +1,222 @@
+{
+  "_comment": [
+    "GAUSSIAN GOLDEN — every hash below was produced TWICE: once by the pre-EMG parent commit",
+    "52e6c91 (which had no --peak-shape flag at all, so it renders the Gaussian by construction),",
+    "and once by this tree with `--peak-shape gaussian`. Both runs agreed. tests/golden_gaussian.rs",
+    "re-runs the same four writer/mode combinations and re-checks them, so any future drift in the",
+    "Gaussian path fails a test instead of silently restating 124 h of cached renders.",
+    "",
+    "WHAT IS HASHED, AND WHY IT IS SPLIT",
+    "  signal  = the rendered measurement. MUST equal the parent commit byte for byte: this covers",
+    "            quantisation, zstd compression, frame indexing and the vendor container.",
+    "  metadata= the provenance stamp this work ADDS (peak shape + k + n_sigma). It is expected to",
+    "            differ from the parent, and its content is pinned here so the stamp itself cannot",
+    "            drift either. For analysis.tdf, parent-vs-head equality was verified by comparing",
+    "            full `sqlite3 .dump` output modulo exactly the three Sim* rows listed below.",
+    "",
+    "Regenerate: tests/golden/regenerate.sh (see that script for the parent-build procedure).",
+    "Fixture paths are machine-local; the test SKIPS (loudly) a case whose inputs are absent, and",
+    "FAILS if that leaves nothing to check."
+  ],
+  "parent_commit": "52e6c91",
+  "head_flag": "--peak-shape gaussian",
+  "fixtures": {
+    "precursors": "/scratch/timsim-demo/ramp-smoke/n2000_noiseless/precursors/ba1742df6d696d0b/precursors.parquet",
+    "peptide_rt": "/scratch/timsim-demo/ramp-smoke/n2000_noiseless/rt/44cfb3eff15d42df/peptide_rt.parquet",
+    "ion_spectra": "/scratch/timsim-demo/ramp-smoke/n2000_noiseless/spectra/d0e3eea0d6b67903/ion_spectra",
+    "precursor_ccs": "/scratch/timsim-demo/ramp-smoke/n2000_noiseless/ccs/2c56f0dd7ff8a6fe/precursor_ccs.parquet",
+    "peptide_quantities": "/scratch/timsim-demo/ramp-smoke/n2000_noiseless/peptide_yield/ecc4dba04ad1f6e0/peptide_quantities.parquet",
+    "reference_d": "/scratch/timsim-demo/TIMSIM-HeLa-RUSTW-SMOKE/TIMSIM-HeLa-RUSTW-SMOKE.d",
+    "thermo_template": "/scratch/timsim-demo/orbi_hela_dia.raw"
+  },
+  "cases": [
+    {
+      "name": "bruker_dia",
+      "bin": "timsim-render",
+      "args": [
+        "--precursors", "{precursors}",
+        "--peptide-rt", "{peptide_rt}",
+        "--ion-spectra", "{ion_spectra}",
+        "--precursor-ccs", "{precursor_ccs}",
+        "--peptide-quantities", "{peptide_quantities}",
+        "--sample", "A_R1",
+        "--reference-d", "{reference_d}",
+        "--dia",
+        "--n-frames", "1200",
+        "--intensity-scale", "500000.0",
+        "--out", "{out}/data.d",
+        "--truth", "{out}/truth.parquet",
+        "--peak-shape", "gaussian"
+      ],
+      "needs": ["precursors", "peptide_rt", "ion_spectra", "precursor_ccs", "peptide_quantities", "reference_d"],
+      "artifacts": [
+        {
+          "path": "data.d/analysis.tdf_bin",
+          "role": "signal",
+          "hash": "file_sha256",
+          "sha256": "562f5ec8704a00b8f538c73eeb7c6aa484601c015a236dd2df3ad43ca02aeade",
+          "parent_equal": true
+        },
+        {
+          "path": "data.d/analysis.tdf",
+          "role": "signal+metadata",
+          "hash": "file_sha256",
+          "sha256": "b0499710bf8004bb1b08374be4a9132b7b927d4de835a5dbf8a52514f6eb74d5",
+          "parent_equal": false,
+          "parent_differs_only_by": [
+            "INSERT INTO GlobalMetadata VALUES('SimPeakShape','gaussian')",
+            "INSERT INTO GlobalMetadata VALUES('SimEmgK','0.0')",
+            "INSERT INTO GlobalMetadata VALUES('SimNSigma','3.0')"
+          ],
+          "dump_sha256_without_provenance": "6d185c5f73a373786cd86938f5024548ff8d493fd681dc8548ae0d7385469192"
+        },
+        {
+          "path": "truth.parquet",
+          "role": "signal+metadata",
+          "hash": "parquet_data_sha256",
+          "sha256": "1050eceec7c60c15a9aad6f767255b7de6ab1f4359db7bcd4f809e94ad2437c5",
+          "parent_equal": true,
+          "file_sha256": "794ca2c6131f89266d8ca9c7fdcd20bb037ed5fd62d177996072c208a76f0146"
+        }
+      ]
+    },
+    {
+      "name": "bruker_dda",
+      "bin": "timsim-render",
+      "args": [
+        "--dda",
+        "--precursors", "{precursors}",
+        "--peptide-rt", "{peptide_rt}",
+        "--ion-spectra", "{ion_spectra}",
+        "--precursor-ccs", "{precursor_ccs}",
+        "--peptide-quantities", "{peptide_quantities}",
+        "--sample", "A_R1",
+        "--reference-d", "{reference_d}",
+        "--n-frames", "1200",
+        "--intensity-scale", "500000.0",
+        "--precursors-every", "10",
+        "--max-precursors", "25",
+        "--exclusion-width", "25",
+        "--out", "{out}/data.d",
+        "--dda-truth", "{out}/dda_truth.parquet",
+        "--peak-shape", "gaussian"
+      ],
+      "needs": ["precursors", "peptide_rt", "ion_spectra", "precursor_ccs", "peptide_quantities", "reference_d"],
+      "artifacts": [
+        {
+          "path": "data.d/analysis.tdf_bin",
+          "role": "signal",
+          "hash": "file_sha256",
+          "sha256": "97193228e61ffe2f3dc409e11a9f029976cb1a16b3361e40b4aa58bc3869237a",
+          "parent_equal": true
+        },
+        {
+          "path": "data.d/analysis.tdf",
+          "role": "signal+metadata",
+          "hash": "file_sha256",
+          "sha256": "81827a220560209bc954a3f296ee5132da5e705feccb02951f08e1c7ab86e1e3",
+          "parent_equal": false,
+          "parent_differs_only_by": [
+            "INSERT INTO GlobalMetadata VALUES('SimPeakShape','gaussian')",
+            "INSERT INTO GlobalMetadata VALUES('SimEmgK','0.0')",
+            "INSERT INTO GlobalMetadata VALUES('SimNSigma','3.0')"
+          ],
+          "dump_sha256_without_provenance": "3dd786480a9b65b5893426801098d14676a9340f30b55c8e9b672b28ce3a6f96"
+        },
+        {
+          "path": "dda_truth.parquet",
+          "role": "signal+metadata",
+          "hash": "parquet_data_sha256",
+          "sha256": "3907965b6fa9e26866f41d906ce5e664ce33140b126aea5288bfc95e2726be2d",
+          "parent_equal": true,
+          "file_sha256": "95b29a63e8cb054d8b9c06cb635c6c3fcaf7bb1718fe6317bf6b36a4b7ba37a6"
+        }
+      ]
+    },
+    {
+      "name": "sciex",
+      "bin": "timsim-render-sciex",
+      "args": [
+        "--precursors", "{precursors}",
+        "--peptide-rt", "{peptide_rt}",
+        "--ion-spectra", "{ion_spectra}",
+        "--peptide-quantities", "{peptide_quantities}",
+        "--sample", "A_R1",
+        "--gradient-length-s", "600.0",
+        "--cycle-time-s", "3.0",
+        "--mz-min", "400.0",
+        "--mz-max", "1200.0",
+        "--window-width", "25.0",
+        "--collision-energy", "25.0",
+        "--intensity-scale", "500000.0",
+        "--out", "{out}/sciex.mzML",
+        "--truth", "{out}/truth.parquet",
+        "--peak-shape", "gaussian"
+      ],
+      "needs": ["precursors", "peptide_rt", "ion_spectra", "peptide_quantities"],
+      "artifacts": [
+        {
+          "path": "sciex.mzML",
+          "role": "signal",
+          "hash": "file_sha256",
+          "sha256": "4fcb4c0bca10db3371c45e537241239d253f088eeaac69da11e3f91f81e880cc",
+          "parent_equal": true
+        },
+        {
+          "path": "truth.parquet",
+          "role": "signal+metadata",
+          "hash": "parquet_data_sha256",
+          "sha256": "4e3c92c2ba0e49e5ba788963fb142e6af40165519e3e3dd6a644e0d400dbf59e",
+          "parent_equal": true,
+          "file_sha256": "26f44767128ca19a86839f40e664c0d5f7932855cdfd274b2516021dcdf5cf04"
+        }
+      ]
+    },
+    {
+      "name": "thermo",
+      "bin": "timsim-render-thermo",
+      "args": [
+        "--precursors", "{precursors}",
+        "--peptide-rt", "{peptide_rt}",
+        "--ion-spectra", "{ion_spectra}",
+        "--peptide-quantities", "{peptide_quantities}",
+        "--sample", "A_R1",
+        "--template", "{thermo_template}",
+        "--intensity-scale", "500000.0",
+        "--method", "DIA",
+        "--expected-ce", "25.0",
+        "--out", "{out}/data.raw",
+        "--thermo-truth", "{out}/truth.parquet",
+        "--peak-shape", "gaussian"
+      ],
+      "needs": ["precursors", "peptide_rt", "ion_spectra", "peptide_quantities", "thermo_template"],
+      "artifacts": [
+        {
+          "path": "data.raw",
+          "role": "signal",
+          "hash": "file_sha256",
+          "sha256": "d8c07cf56542f6ece81d95909935cef6a960c5427826648fdbb13ccb3ff14ec4",
+          "parent_equal": true
+        },
+        {
+          "path": "truth.parquet",
+          "role": "signal+metadata",
+          "hash": "parquet_data_sha256",
+          "sha256": "ebc4cfab99f2e8ab893a9cfdf5229118ed258f3f427708b81dd51546a9034b60",
+          "parent_equal": true,
+          "file_sha256": "b7eaa4a58d4e1f52147323e7ac343c4ac141423786238c5db31bd6ef077f60b6"
+        }
+      ]
+    }
+  ],
+  "not_exercised": [
+    {
+      "writer": "SCIEX native .wiff",
+      "reason": "No .wiff writer exists in this repo and none is reachable: sciexwiff is legal-held and lives in the rustims satellite. timsim-render-sciex emits open mzML, which IS covered above. No .wiff template exists on this machine either."
+    },
+    {
+      "writer": "timsim-render-bench",
+      "reason": "Not a writer. It renders into memory to measure throughput and produces no artifact to hash. Its shape/geometry handling is covered by the unit tests in src/render.rs (it shares stream_render_flat and the same validators)."
+    }
+  ]
+}

@@ -34,6 +34,9 @@ pub mod mobility_ce;
 /// MS2 (DIA fragment) emission + its independent conservation oracle.
 #[cfg(feature = "tdf")]
 pub mod ms2;
+/// Which elution kernel produced an artifact, recorded INTO the artifact — the answer to "is this
+/// cached render stale?" that does not depend on a fingerprint travelling alongside the file.
+pub mod provenance;
 pub mod render;
 pub mod sequences;
 pub mod spec;

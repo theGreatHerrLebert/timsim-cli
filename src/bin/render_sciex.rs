@@ -171,20 +171,24 @@ fn build_windows(a: &Args) -> Result<Vec<(f64, f64)>> {
 enum PeakShapeArg { Gaussian, Emg }
 
 impl PeakShapeArg {
-    fn resolve(self, emg_k: f64, n_sigma: f64) -> timsim_cli::render::PeakShape {
-        match self {
+    /// Fallible: `--emg-k` is user input, and a `NaN`/negative/infinite `k` used to be absorbed into
+    /// a silently different shape rather than refused. See `timsim_cli::render::PeakShape::emg`.
+    fn resolve(self, emg_k: f64, n_sigma: f64) -> Result<timsim_cli::render::PeakShape> {
+        Ok(match self {
             PeakShapeArg::Gaussian => timsim_cli::render::PeakShape::Gaussian,
-            PeakShapeArg::Emg => timsim_cli::render::PeakShape::Emg(
-                timsim_cli::render::Emg::new(emg_k, n_sigma)),
-        }
+            PeakShapeArg::Emg => timsim_cli::render::PeakShape::emg(emg_k, n_sigma)?,
+        })
     }
 }
 
 fn main() -> Result<()> {
     let a = Args::parse();
-    for (name, v, pos) in [("sigma-seconds", a.sigma_seconds, true), ("intensity-scale", a.intensity_scale, true)] {
-        if !(v.is_finite() && (!pos || v > 0.0)) { return Err(anyhow!("--{name} must be finite and > 0")); }
+    if !(a.intensity_scale.is_finite() && a.intensity_scale > 0.0) {
+        return Err(anyhow!("--intensity-scale must be finite and > 0"));
     }
+    // `--n-sigma` was NOT validated here at all (only `--sigma-seconds` was), so a NaN radius
+    // reached `elution_half_widths` and produced an empty active set. One shared validator now.
+    timsim_cli::render::validate_elution_widths("sigma-seconds", a.sigma_seconds, a.n_sigma)?;
     if !(a.gradient_trim.is_finite() && (0.0..0.5).contains(&a.gradient_trim)) {
         return Err(anyhow!("--gradient-trim must be in [0, 0.5)"));
     }
@@ -278,7 +282,7 @@ fn main() -> Result<()> {
     eprintln!("precursors: {} eligible ({} outside window coverage)", precs.len(), outside);
 
     // Active-set sweep over scans (schedule RT monotonic). A precursor is active in [apex ± nσ·σ].
-    let shape = a.peak_shape.resolve(a.emg_k, a.n_sigma);
+    let shape = a.peak_shape.resolve(a.emg_k, a.n_sigma)?;
     let (hleft, hright) = timsim_cli::render::elution_half_widths(a.sigma_seconds, a.n_sigma, &shape);
     let mut order: Vec<usize> = (0..precs.len()).collect();
     order.sort_by(|&x, &y| precs[x].apex_rt.total_cmp(&precs[y].apex_rt));
@@ -362,7 +366,12 @@ fn main() -> Result<()> {
             iw.push(wts.iter().any(|wt| wt.probabilities(&[p.mz])[0] > 0.5));
         }
         let nrows = pc.len();
-        let schema = Arc::new(Schema::new(vec![
+        // The answer key self-identifies its elution kernel: `truth.parquet` used to be BYTE-IDENTICAL
+        // between a Gaussian and an EMG render, so a scored result could not be traced back to the
+        // shape that produced it. Arrow schema metadata, so `timsim_schema::metadata()` — the reader
+        // the pipeline already uses for `peptide_rt` — picks it up. Footer only: the data pages are
+        // unchanged. See `timsim_cli::provenance`.
+        let schema = Arc::new(Schema::new_with_metadata(vec![
             Field::new("precursor_id", DataType::UInt64, false),
             Field::new("peptide_id", DataType::UInt64, false),
             Field::new("charge", DataType::Int64, false),
@@ -371,7 +380,9 @@ fn main() -> Result<()> {
             Field::new("abundance", DataType::Float64, false),
             Field::new("has_ms2", DataType::Boolean, false),
             Field::new("in_any_window", DataType::Boolean, false),
-        ]));
+        ],
+            timsim_cli::provenance::schema_metadata(&shape, a.n_sigma),
+        ));
         let batch = RecordBatch::try_new(schema.clone(), vec![
             Arc::new(U64::from(pc)), Arc::new(U64::from(pe)), Arc::new(Int64Array::from(ch)),
             Arc::new(F64::from(mo)), Arc::new(F64::from(rtc)), Arc::new(F64::from(ab)),

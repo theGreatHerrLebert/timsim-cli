@@ -365,25 +365,30 @@ enum PeakShapeArg {
 }
 
 impl PeakShapeArg {
-    fn resolve(self, emg_k: f64, n_sigma: f64) -> timsim_cli::render::PeakShape {
-        match self {
+    /// Fallible: `--emg-k` is user input, and a `NaN`/negative/infinite `k` used to be absorbed into
+    /// a silently different shape rather than refused. See `timsim_cli::render::PeakShape::emg`.
+    fn resolve(self, emg_k: f64, n_sigma: f64) -> Result<timsim_cli::render::PeakShape> {
+        Ok(match self {
             PeakShapeArg::Gaussian => timsim_cli::render::PeakShape::Gaussian,
-            PeakShapeArg::Emg => {
-                timsim_cli::render::PeakShape::Emg(timsim_cli::render::Emg::new(emg_k, n_sigma))
-            }
-        }
+            PeakShapeArg::Emg => timsim_cli::render::PeakShape::emg(emg_k, n_sigma)?,
+        })
     }
 }
 
 fn main() -> Result<()> {
     let a = Args::parse();
+    // The same shared validator the three production renderers use. The bench is the tool the
+    // render's memory/throughput claims are measured with, so it must not accept a geometry the
+    // renderers would reject — and `sigma_frames`/`n_sigma` were previously unchecked here.
+    timsim_cli::render::validate_elution_widths("sigma-frames", a.sigma_frames, a.n_sigma)?;
+    timsim_cli::render::validate_elution_widths("sigma-scans", a.sigma_scans, a.n_sigma)?;
     let g = Geometry {
         n_frames: a.n_frames,
         n_scans: a.n_scans,
         sigma_frames: a.sigma_frames,
         sigma_scans: a.sigma_scans,
         n_sigma: a.n_sigma,
-        shape: a.peak_shape.resolve(a.emg_k, a.n_sigma),
+        shape: a.peak_shape.resolve(a.emg_k, a.n_sigma)?,
     };
     let t_load = std::time::Instant::now();
 

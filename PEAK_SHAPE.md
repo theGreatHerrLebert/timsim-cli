@@ -4,15 +4,32 @@
 
 `timsim-render` (and `-bench`, `-thermo`, `-sciex`) grew `--peak-shape {gaussian|emg}`, **defaulting
 to `emg`**: v1's exponentially modified Gaussian instead of the symmetric Gaussian v2 shipped with.
-`--peak-shape gaussian` reproduces the old binary **byte for byte**.
+`--peak-shape gaussian` reproduces the pre-EMG binary **byte for byte** — proved on real `.d`,
+`.raw` and mzML output for all four writer/mode combinations by
+[the Gaussian golden](#the-gaussian-golden), not just on kernel values.
+
+Every render now also **stamps its resolved kernel into its own output**
+([self-describing artifacts](#self-describing-artifacts-the-actual-fix)), `--emg-k` is
+[validated instead of clamped](#input-validation), and the truncation window
+[inverts the survival function](#the-truncation-window-inverted-not-approximated) instead of
+approximating it.
 
 > ## ⚠️ READ THIS BEFORE TRUSTING ANY CACHED RENDER
 >
 > **Changing the default changed render output while leaving the command string untouched, so
-> necroflow cannot tell that cached renders are stale.** Every `.d` under
+> necroflow's fingerprint cannot tell that cached renders are stale.** Every `.d` under
 > `/media/hd01/timsim-cohort/work/nodes/render_a2/` was produced with the OLD Gaussian and is
-> reported by necroflow as `up_to_date`. Nothing in this change fixes that — see
-> [Cache staleness](#cache-staleness) for the measurement and the options.
+> reported by necroflow as `up_to_date`.
+>
+> What is fixed: **the artifact now says which kernel made it.** Every render stamps
+> `(peak_shape, emg_k, n_sigma)` into the `.d`'s `GlobalMetadata` and into the answer key's parquet
+> metadata, so a stale artifact is identifiable *from its own contents* — see
+> [Self-describing artifacts](#self-describing-artifacts-the-actual-fix). A `.d` with no
+> `SimPeakShape` row predates this change and is Gaussian.
+>
+> What is **not** fixed: the fingerprint itself. That needs one edit to the live flow, which
+> re-fingerprints 30 arms. The exact edit and its measured cost are in
+> [The flow edit](#the-flow-edit-not-applied-here).
 
 ## Why
 
@@ -78,6 +95,10 @@ lives in the render and nowhere else.
 | EMG vs **v1's realised per-frame profile** (598 frames, 5 peptides, `k` 0.20–1.91) | max 5.06e-5, median 2.63e-5 — i.e. at v1's own 4-decimal storage granularity |
 | mode anchoring: v2's golden-section mode vs v1's `erfcxinv` inversion | agree to 3e-8 … 3e-7 sigma across `k` 0.097–1.91 |
 | default (emg) vs pre-EMG binary | differs, as it must |
+| `--peak-shape gaussian` vs parent commit `52e6c91`, **all four writers**, whole real artifacts | **byte-identical** on every signal carrier — see [the Gaussian golden](#the-gaussian-golden) |
+| the recorded `(shape, k, n_sigma)` reconstructing the shape it describes | `PeakShape` equality including derived constants, over a 0 … 1e3 `k` grid × four `n_sigma` (`provenance_round_trips`) |
+| fractions/ordinates finite and non-negative | 20-point `k` grid (`0`, subnormal, 1e-300 … 1e300) × 21-point `z` grid (`±1e300`) |
+| captured mass `>= 1 - 2p` | every `k` in that grid × `n_sigma` 2/3/4/6 (`truncation_window_captures_the_promised_mass_for_every_k`) |
 
 `tests/emg_v1_parity.rs` pins all three. Its fixture (`tests/data/v1_emg_profiles.json`) is a verbatim
 dump of a real v1 run's `synthetic_data.db` — the comparison is against v1's **output**, never against
@@ -127,20 +148,213 @@ Measured on `/media/hd01/timsim-cohort/work/nodes/render_a2/` (2026-08-09):
 * Nodes reporting `up_to_date`: **70 / 70**.
 * Re-render cost for the live arms: **124.2 h serial** (~5.2 days) and 151.9 GB rewritten.
   `/media/hd01` has 485 GB free, so a side-by-side re-render fits.
-* `truth.parquet` is **identical** between the Gaussian and EMG renders (sha256
-  `f0857aa7c2e7f3c705dfa2e1f1f8b5f4d5644ea361b57767131d7d5f48e4f7f4`), so the answer key does not
-  record which shape produced the `.d` either. A stale `.d` cannot be detected from its own outputs.
+* `truth.parquet` **used to be identical** between the Gaussian and EMG renders (sha256
+  `f0857aa7c2e7f3c705dfa2e1f1f8b5f4d5644ea361b57767131d7d5f48e4f7f4` either way), so the answer key
+  did not record which shape produced the `.d`. **A stale `.d` could not be detected from its own
+  outputs.** That is now fixed — see below.
 
-### Options (none applied here)
+## Self-describing artifacts (the actual fix)
 
-1. **Do nothing and pass `--peak-shape gaussian` explicitly** in the flow's render command. The 30
-   cached arms stay valid; the flag now appears in the command string, so any later change is
-   fingerprint-visible. Costs one edit to `timsim_flow.py` and re-fingerprints all 30 arms (they
-   would rebuild once).
-2. **Adopt EMG and re-render**, again by putting `--peak-shape emg` in the command so the change is
-   visible. ~124 h.
-3. **Delete the 70 node directories** to force a rebuild. Loses the Gaussian arms irrecoverably and
-   still leaves the default invisible to future fingerprints.
+Documentation and manual invalidation are not reproducibility mechanisms. A fingerprint is a
+mechanism, but it only protects artifacts *inside* the flow: a `.d` that is copied, re-pathed,
+restored from backup or handed to a collaborator arrives with no fingerprint attached. So the record
+goes **into the artifact**.
 
-Whichever is chosen, **the flag belongs in the command string.** A default that changes output but
-not the fingerprint is exactly the failure mode this file exists to document.
+Every render now stamps its resolved kernel (`timsim_cli::provenance`):
+
+| artifact | where | keys |
+| --- | --- | --- |
+| Bruker `.d` (DIA and DDA) | `analysis.tdf` → `GlobalMetadata` | `SimPeakShape`, `SimEmgK`, `SimNSigma` |
+| every answer key parquet (Bruker `--truth` / `--dda-truth`, Thermo `--thermo-truth`, SCIEX `--truth`) | Arrow schema metadata in the parquet footer | `peak_shape`, `emg_k`, `n_sigma` |
+
+* **Three keys, not one.** They are exactly the arguments to `PeakShape::emg`, so the record
+  *reconstructs the kernel* rather than labelling it: `provenance::parse_shape` returns a `PeakShape`
+  that compares `==` to the one the render used, derived constants (mode offset, tail reach, peak
+  ordinate) included. `n_sigma` is in there because every one of those constants depends on it.
+* **The Gaussian records `emg_k = 0`.** Not a placeholder: the Gaussian *is* the `k = 0` member of
+  the family (see [Input validation](#input-validation-and-the-k--0-limit)), so `(name, k)` is a
+  complete description, and `k = 0` parses back to `PeakShape::Gaussian`.
+* **The parquet stamp is the one that covers all four writers.** The Thermo `.raw` and SCIEX mzML
+  writers are upstream crates with no provenance seam; their answer key is where the shape can be
+  recorded without forking them. Since the answer key is what every downstream scorer reads, a scored
+  number can always be traced back to the kernel behind it.
+
+Measured on a real render (12,228 precursors, `.d` + `truth.parquet`):
+
+```
+$ sqlite3 gaussian.d/analysis.tdf "SELECT Key,Value FROM GlobalMetadata WHERE Key LIKE 'Sim%'"
+SimPeakShape|gaussian     SimEmgK|0.0                     SimNSigma|3.0
+$ sqlite3 emg.d/analysis.tdf      "SELECT Key,Value FROM GlobalMetadata WHERE Key LIKE 'Sim%'"
+SimPeakShape|emg          SimEmgK|0.47619047619047616     SimNSigma|3.0
+
+truth.parquet   gaussian -> 794ca2c6131f89266d8ca9c7fdcd20bb037ed5fd62d177996072c208a76f0146
+                emg      -> 2a34906a5c5eba26d0c125bd4f970690973c19b1e3d983bd132869b795fe00f7
+```
+
+The two answer keys are no longer the same file. **A `.d` with no `SimPeakShape` row predates this
+change and is therefore Gaussian** — which is exactly what the 30 cached cohort arms are.
+
+## The flow edit (NOT applied here)
+
+Making the *fingerprint* see the shape needs one edit to the live
+`/scratch/timsim-demo/timsim-necro-repo/flow/timsim_flow.py`. It is written up rather than made,
+because it is a cache decision with a five-day price tag and it belongs to the person who owns the
+cohort.
+
+### The edit
+
+necroflow fingerprints a node on its **command template + config + input hashes**, and shell-quotes
+each `{placeholder}` individually, so flag NAMES must be literal in the template and only VALUES may
+be placeholders. Four templates carry a render, and each needs two literal tokens plus one parameter:
+
+| template | line (at 1777-line revision) |
+| --- | --- |
+| `_RENDER_HEAD` (Bruker DIA; feeds `render` and `render_a2`) | 680 |
+| `render_dda` | 769 |
+| `render_thermo` | 637 |
+| `render_sciex` | 807 |
+
+For each: append `--peak-shape {peak_shape}` to the command string, add `peak_shape: str = "emg"`
+(or `"gaussian"`) to the decorated function's signature, and thread it through the factory that
+builds the node (`_render(sid)` at 1369 and its Thermo/SCIEX/DDA siblings) plus a
+`--peak-shape` CLI argument next to `--intensity-scale` at 1540. Roughly 12 lines across 4 command
+sites. `--emg-k` and `--sigma-frames` deserve the same treatment for the same reason; they are
+currently invisible too.
+
+### The cost, measured
+
+Re-measured on `/media/hd01/timsim-cohort/work/nodes/` on the day of this change:
+
+| node kind | dirs | live (`max_peptides = 0`) | commands mentioning `--peak-shape` | live wall | live output |
+| --- | --- | --- | --- | --- | --- |
+| `render_a2` | 70 | **30** | 0 | **124.2 h** | **151.9 GB** |
+| `render_thermo` | 2 | 0 | 0 | — | — |
+
+Adding the flag changes the command template, hence the fingerprint, hence **all 30 live arms
+rebuild once: ~124 h serial (~5.2 days) and 151.9 GB rewritten.** That cost is identical whichever
+value is passed — it is the price of making the parameter visible, not of changing it. `/media/hd01`
+had 485 GB free, so a side-by-side re-render fits.
+
+### The three choices, and what each costs
+
+1. **Pin `--peak-shape gaussian` in the template.** The 30 cached arms are *scientifically* still
+   valid (they are Gaussian, and the flag now says so), but they still rebuild once because the
+   fingerprint moved. ~124 h, and the cohort keeps the shape it has always had.
+2. **Pin `--peak-shape emg`.** Same ~124 h, and the cohort gains v1 shape parity. This is the reason
+   the EMG work exists, so it is the recommendation — but it is a science decision, not a code one.
+3. **Do neither.** The arms stay cached and stay Gaussian. This is now *safe but silent*: the
+   artifacts identify themselves correctly, so nothing is misread, but the next default change is
+   again invisible to the fingerprint.
+
+**Whichever is chosen, the flag belongs in the command string.** A default that changes output but
+not the fingerprint is exactly the failure mode this file exists to document — the artifact stamp
+makes it detectable, not impossible.
+
+## Input validation
+
+`--emg-k` is user input and was not treated as such. `Emg::new` ran every value through
+`k.max(1e-12)`:
+
+| input | old behaviour | now |
+| --- | --- | --- |
+| `k < 0` | silently became `1e-12` — a shape the user never asked for | `Err`: `--emg-k must be >= 0` |
+| `NaN` | `f64::max` returns the *other* operand, so `NaN` also became `1e-12` | `Err`: `--emg-k must be finite` |
+| `+inf` | survived the clamp; bracket `[-1, inf]` → `NaN` mode → `NaN` half-widths → `NaN` weights **written to disk** | `Err`: `--emg-k must be finite` |
+| `k == 0` | `1e-12`, i.e. an EMG that is merely *close* to the documented Gaussian limit | **exactly `PeakShape::Gaussian`** |
+| subnormal `k` (`< ~5.6e-309`) | `1/k` overflows, the tail term underflows, the peak-height normaliser becomes `0/0` → `NaN` ordinates | `PeakShape::Gaussian`, documented and tested |
+
+`--sigma-frames`, `--sigma-scans`, `--sigma-seconds` and `--n-sigma` are now validated by one shared
+`render::validate_elution_widths`, called by all four renderers. Previously only
+`timsim-render-thermo` checked anything; `timsim-render`, `-bench` and `-sciex` accepted a `NaN`
+`--n-sigma` and rendered an empty active set.
+
+### The `k = 0` limit
+
+`k = 0` returns the `Gaussian` **variant**, not an EMG with a tiny `k`. That makes the advertised
+limit exact rather than approximate: it is bit-identical to `--peak-shape gaussian`, which the tests
+assert directly (`k_zero_is_exactly_the_gaussian_variant` compares `to_bits()` against
+`gauss_frac`). It also means `(shape_name, k)` is a total encoding of the kernel, which is what lets
+the provenance record round-trip.
+
+## The truncation window: inverted, not approximated
+
+The right-hand truncation used `tail_reach = k·ln(1/p)` — the exponential tail's *asymptote*, exact
+as `k → ∞` and progressively loose below it. It provably keeps the apex (so it avoids v1's
+truncation bug), but ">99.7 % captured" could only be checked at whichever `k` someone tested.
+
+It now **numerically inverts the actual EMG survival function**: bisect `S(n_sigma + tail_reach) = p`
+where `p = ½·erfc(n_sigma/√2)` is the mass a Gaussian leaves outside `n_sigma`. Two consequences:
+
+* `emg_sf_std` computes `S` directly as `½·[erfc(z/√2) + exp(−z²/2)·erfcx((1/k − z)/√2)]` — a sum of
+  non-negative terms. `1 − emg_cdf_std(z)` is useless here: the CDF is built from `erfc(−z/√2)`,
+  which saturates at 2 for `z ≳ 6`, so the complement is pure cancellation exactly where the window
+  is solved.
+* The guarantee becomes **structural**: the left edge is at `z = −n_sigma`, where the EMG's CDF is
+  bounded above by the Gaussian's, and the right edge is where the EMG's own `S` equals `p`. So
+  captured mass `≥ 1 − 2p` for **every** `k`, not for one. `truncation_window_captures_the_promised_mass_for_every_k`
+  asserts it over a 20-point `k` grid (`0`, subnormals, `1e-300` … `1e300`) × four `n_sigma`.
+
+The alternative — declaring and enforcing a supported `k` range — was rejected: the inversion costs
+one ~160-iteration loop **per render** (not per ion, not per frame), and an enforced range would have
+had to be justified by the same numerics anyway.
+
+### This CHANGES the default (emg) render — measured
+
+The old asymptote was *over*-generous, so the inversion NARROWS the window. At the default
+`k = 10/21`, `n_sigma = 3`: `tail_reach` 3.1465 σ → 1.1927 σ, captured mass 99.947 % → 99.814 %
+(floor 99.730 %). Same direction at every `k` (0.25: 1.652 → 0.400; 9.5: 62.77 → 59.83).
+
+Measured end to end on a 12,228-precursor DIA render (`--sigma-frames 30`), commit `04645db` vs this
+tree, both at the default EMG:
+
+| | `04645db` | now | delta |
+| --- | --- | --- | --- |
+| `analysis.tdf_bin` | 14,120,245 B | 13,923,141 B | −1.40 % |
+| summed ion current | 1.181317e9 | 1.180168e9 | **−0.097 %** |
+| peaks written | 8,052,421 | 7,941,772 | −1.37 % |
+
+The ion current barely moves — what disappears is far-tail bins that were below the emission floor
+anyway — but **`--peak-shape emg` output is not byte-identical to `3336bfe`/`04645db`.** Nothing was
+cached at those commits (the flag is 0/70 in every node command), so nothing is invalidated; it is
+recorded here because it is a deliberate change to the default kernel, not a refactor.
+
+The mode search picked up a related fix. Golden section shrinks its bracket by `0.618²⁰⁰ ≈ 1.8e-42`,
+so on `[-1, k+1]` with `k = 1e100` it resolved the mode only to `~1e58`. A second bound —
+`u ≤ √(2 ln k)` at the mode, from `Φ(u) ≥ ½` — caps the bracket at ~25 for every representable `k`.
+It is inert for `k ≤ 1`, so v1's default `k = 10/21` keeps the exact mode offset it always had.
+
+## The Gaussian golden
+
+`tests/emg_v1_parity.rs` and the unit tests prove **kernel** equivalence: `elution_frac(Gaussian, ..)`
+is bit-for-bit `gauss_frac(..)`. That is a statement about one function. What 124 h of cached renders
+depend on is a statement about the whole pipeline — placement, sweep, quantisation, zstd framing,
+SQLite tables, vendor container, answer key.
+
+So `tests/golden_gaussian.rs` renders **real artifacts** and hashes them against artifacts produced
+by the pre-EMG parent commit `52e6c91`, which has no `--peak-shape` flag at all and therefore renders
+the Gaussian by construction. Four writer/mode combinations, ~9 s total on a 12,228-precursor
+fixture:
+
+| case | binary | signal artifact | parent-equal |
+| --- | --- | --- | --- |
+| Bruker DIA | `timsim-render --dia` | `analysis.tdf_bin` `562f5ec8…` | ✅ |
+| Bruker DDA | `timsim-render --dda` | `analysis.tdf_bin` `97193228…` | ✅ |
+| SCIEX SWATH | `timsim-render-sciex` | `sciex.mzML` `4fcb4c0b…` | ✅ |
+| Thermo Astral | `timsim-render-thermo` | `data.raw` `d8c07cf5…` | ✅ |
+
+plus each case's answer key, hashed over the parquet **data region** (file minus thrift footer, so
+the added footer metadata is excluded and nothing else is) — all four parent-equal. `analysis.tdf` is
+the one artifact that legitimately differs, by exactly the three `Sim*` rows; that was verified by
+diffing full `sqlite3 .dump` output, and its hash is pinned too so the stamp cannot drift either.
+
+`tests/golden/regenerate.sh` re-derives all of it, including building the parent commit in its own
+worktree and target dir.
+
+**Not exercised, and why:**
+
+* **SCIEX native `.wiff`** — no `.wiff` writer exists in this repo or is reachable from it
+  (`sciexwiff` is legal-held and lives in the rustims satellite), and no `.wiff` template exists on
+  this machine. The open-mzML SCIEX path *is* covered.
+* **`timsim-render-bench`** — not a writer. It renders into memory to measure throughput and emits no
+  artifact to hash. It shares `stream_render_flat` and the shared validators with `timsim-render`, so
+  its shape handling is covered by the unit tests.

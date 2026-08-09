@@ -47,6 +47,11 @@ rayon = "1.10"
 # `.d` writer + index converters (for `timsim-render`). Optional so the other lightweight tools don't
 # pull ms-io (polars + bundled SQLite). Direct path during R4 bootstrap (0.2.0 not yet published).
 ms-io = { version = "0.2.0", optional = true }
+# Stamping the peak-shape provenance rows into a finished `.d`'s `GlobalMetadata`. ms-io owns the
+# `analysis.tdf` connection and exposes no seam for extra rows, so the stamp reopens the file after
+# `finalize`. Pinned to the SAME version and features ms-io already links, so cargo unifies the crate:
+# no extra build time, and no second bundled SQLite in the binary.
+rusqlite = { version = "0.32.1", features = ["bundled"], optional = true }
 # The v2 sim engine — only the Thermo `.raw` writer seam (render_thermo bin) uses it. Optional.
 timsim-core = { version = "0.1.0", optional = true }
 # The peptide-ion spectrum machinery (precursor + fragment isotopic spectra) the render uses. Optional,
@@ -62,11 +67,11 @@ timsim-types = { version = "0.1.0", optional = true }
 # Enables everything that touches the real TDF format + spectrum generation — the encode path in the
 # throughput bench, the `timsim-render` .d writer, and the mscore peptide-ion spectra:
 #   cargo build --release -p timsim-cli --features tdf
-tdf = ["dep:ms-io", "dep:mscore", "dep:timsim-types"]
+tdf = ["dep:ms-io", "dep:mscore", "dep:timsim-types", "dep:rusqlite"]
 # The Thermo Astral `.raw` render driver (timsim-render-thermo): pulls timsim-core's thermo feature (the
 # thermorawfile-backed writer seam). Off by default so default builds don't pull the thermo dep.
 #   cargo build --release -p timsim-cli --features thermo
-thermo = ["dep:ms-io", "dep:timsim-core", "timsim-core/thermo", "dep:mscore"]
+thermo = ["dep:ms-io", "dep:timsim-core", "timsim-core/thermo", "dep:mscore", "dep:rusqlite"]
 # The SCIEX ZenoTOF SWATH -> open mzML render driver (timsim-render-sciex): pulls timsim-core's mzml
 # feature (mzdata-backed writer) + mscore (quadrupole transmission). NO ms-io, NO thermorawfile, NO
 # sciexwiff/sciex-io — the lean mzML path is legally clean (native .wiff is a rustims-local satellite).
@@ -119,3 +124,9 @@ required-features = ["sciex"]
 name = "timsim-spectra"
 path = "src/bin/spectra.rs"
 required-features = ["tdf"]
+
+[dev-dependencies]
+# The Gaussian golden (`tests/golden_gaussian.rs`) hashes real `.d` / `.raw` / mzML output against
+# artifacts produced by the pre-EMG commit. Already in the lock via the TDF stack, so this pulls
+# nothing new.
+sha2 = "0.10"

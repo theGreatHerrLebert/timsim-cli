@@ -49,14 +49,21 @@ pub struct Geometry {
 
 /// Which shape the **elution** term uses.
 ///
-/// # !!! CHANGING THE DEFAULT SILENTLY STALES EVERY CACHED RENDER !!!
+/// # !!! CHANGING THE DEFAULT STALES EVERY CACHED RENDER !!!
 ///
 /// The default is [`PeakShape::Emg`] (v1 parity). necroflow fingerprints a node on its **command
 /// string**, and `--peak-shape` defaults to `emg` without appearing in that string — so a render
-/// cached before this change was produced with the OLD symmetric Gaussian and necroflow **cannot
-/// tell**. Cached artifacts under `work/nodes/render_a2/` are stale-but-undetected. They must be
-/// invalidated by hand (or the arm re-rendered with an explicit `--peak-shape` in the command, which
-/// changes the fingerprint and forces a rebuild). See `PEAK_SHAPE.md`.
+/// cached before this change was produced with the OLD symmetric Gaussian and the fingerprint
+/// **cannot tell**. Cached artifacts under `work/nodes/render_a2/` are stale.
+///
+/// What has changed is that they are no longer *undetectably* stale: every render now stamps its
+/// resolved `(shape, k, n_sigma)` into the `.d`'s `GlobalMetadata` and into the answer key's parquet
+/// metadata ([`crate::provenance`]), so an artifact can be interrogated directly instead of trusted.
+/// A `.d` with no `SimPeakShape` row predates this change and is therefore Gaussian.
+///
+/// Making the *fingerprint* see it still requires putting `--peak-shape` in the flow's command
+/// template, which re-fingerprints and rebuilds the cached arms. That decision, and its measured
+/// cost, is written up in `PEAK_SHAPE.md`; it is deliberately not taken here.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PeakShape {
     /// Symmetric Gaussian — v2's historical shape, and what every cached render used.
@@ -182,6 +189,24 @@ pub fn emg_cdf_std(z: f64, k: f64) -> f64 {
     0.5 * (erfc_nr(-z / std::f64::consts::SQRT_2) - emg_tail_term(z, k))
 }
 
+/// The **standardised** EMG SURVIVAL function `P(Z > z)`, evaluated without cancellation.
+///
+/// `1 - emg_cdf_std(z, k)` is useless in the tail: `emg_cdf_std` is built out of `erfc(-z/sqrt2)`,
+/// which saturates at 2 for `z >~ 6`, so the complement collapses into catastrophic cancellation
+/// exactly where the truncation window has to be solved. Applying `erfc(-x) = 2 - erfc(x)` to
+/// [`emg_cdf_std`] gives the algebraically identical but numerically benign
+///
+/// ```text
+///   S(z) = 0.5 * [ erfc(z/sqrt2) + exp(-z^2/2) * erfcx((1/k - z)/sqrt2) ]
+/// ```
+///
+/// — a sum of two non-negative terms, so it stays accurate down to the smallest representable
+/// probabilities. [`Emg::new`] inverts this to place the right-hand truncation edge.
+#[inline]
+pub fn emg_sf_std(z: f64, k: f64) -> f64 {
+    0.5 * (erfc_nr(z / std::f64::consts::SQRT_2) + emg_tail_term(z, k))
+}
+
 /// Standardised EMG PDF (in `z`), up to the `1/sigma` Jacobian. Only used to locate the mode.
 #[inline]
 fn emg_pdf_std(z: f64, k: f64) -> f64 {
@@ -190,17 +215,169 @@ fn emg_pdf_std(z: f64, k: f64) -> f64 {
     emg_tail_term(z, k)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Peak-shape argument validation
+// ---------------------------------------------------------------------------------------------
+
+/// Why an elution-shape argument was rejected.
+///
+/// Every one of these used to be swallowed. `Emg::new` mapped a negative `k` — and, through
+/// `f64::max`, a `NaN` — onto `1e-12`, i.e. onto a *silently different shape*; `+inf` propagated
+/// into the golden-section bracket and back out as `NaN` half-widths and `NaN` weights, which the
+/// render then wrote to disk. A rejected run is recoverable; a run that quietly renders a different
+/// kernel than the one asked for is not — that is the same class of defect as the cache staleness
+/// this work exists to close.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PeakShapeError {
+    /// `NaN` or `±inf` where a real number is required.
+    NotFinite { name: &'static str, value: f64 },
+    /// Negative where `>= 0` is required.
+    Negative { name: &'static str, value: f64 },
+    /// Zero or negative where `> 0` is required.
+    NotPositive { name: &'static str, value: f64 },
+}
+
+impl std::fmt::Display for PeakShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeakShapeError::NotFinite { name, value } => write!(f, "--{name} must be finite (got {value})"),
+            PeakShapeError::Negative { name, value } => write!(f, "--{name} must be >= 0 (got {value})"),
+            PeakShapeError::NotPositive { name, value } => write!(f, "--{name} must be > 0 (got {value})"),
+        }
+    }
+}
+
+impl std::error::Error for PeakShapeError {}
+
+/// `v` must be a finite number `> 0`. The `!(v > 0.0)` spelling is deliberate: it rejects `NaN`,
+/// which `v <= 0.0` would let through.
+pub fn require_finite_positive(name: &'static str, v: f64) -> Result<f64, PeakShapeError> {
+    if !v.is_finite() {
+        return Err(PeakShapeError::NotFinite { name, value: v });
+    }
+    if !(v > 0.0) {
+        return Err(PeakShapeError::NotPositive { name, value: v });
+    }
+    Ok(v)
+}
+
+/// `v` must be a finite number `>= 0`.
+pub fn require_finite_nonnegative(name: &'static str, v: f64) -> Result<f64, PeakShapeError> {
+    if !v.is_finite() {
+        return Err(PeakShapeError::NotFinite { name, value: v });
+    }
+    if !(v >= 0.0) {
+        return Err(PeakShapeError::Negative { name, value: v });
+    }
+    Ok(v)
+}
+
+/// The **one** validator for the elution knobs every renderer shares: a strictly positive width and
+/// a finite, non-negative truncation radius.
+///
+/// `timsim-render`, `-bench`, `-thermo` and `-sciex` all route through this, so `--sigma-*` and
+/// `--n-sigma` are policed identically everywhere instead of in one binary and not the others (only
+/// `-thermo` checked anything before). `sigma_name` is the caller's spelling of the width flag
+/// (`sigma-frames`, `sigma-scans`, `sigma-seconds`) so the message names a flag the user typed.
+pub fn validate_elution_widths(sigma_name: &'static str, sigma: f64, n_sigma: f64) -> Result<(), PeakShapeError> {
+    require_finite_positive(sigma_name, sigma)?;
+    require_finite_nonnegative("n-sigma", n_sigma)?;
+    Ok(())
+}
+
+impl PeakShape {
+    /// Resolve a tailing factor `k` into a shape. **The only supported way to build an EMG.**
+    ///
+    /// | `k` | result |
+    /// | --- | --- |
+    /// | `NaN`, `±inf` | `Err(NotFinite)` |
+    /// | `< 0` | `Err(Negative)` — a negative `k` is a *left*-tailed peak, which this kernel does not model |
+    /// | `== 0` | **exactly** [`PeakShape::Gaussian`] |
+    /// | subnormal (`1/k` overflows) | [`PeakShape::Gaussian`] — see below |
+    /// | otherwise | [`PeakShape::Emg`] |
+    ///
+    /// **`k == 0` resolves to the Gaussian variant itself, not to an approximation of it.** The
+    /// EMG's `k -> 0` limit *is* the Gaussian, so the old `k.max(1e-12)` clamp answered the
+    /// documented boundary case with a shape that is merely very close to the right one — and one
+    /// whose `1/k = 1e12` runs the numerics through a region nothing tested. Returning
+    /// [`PeakShape::Gaussian`] makes the advertised limit exact and reproducible, and (because it is
+    /// the same variant `--peak-shape gaussian` produces) bit-identical to the pre-EMG render.
+    ///
+    /// The subnormal case is that same statement carried to the edge of the type: below
+    /// `k ~ 5.6e-309`, `1/k` overflows to `+inf`, the tail term underflows to zero and the
+    /// peak-height normaliser becomes `0/0` — while the EMG and the Gaussian differ by `O(k)`,
+    /// hundreds of orders of magnitude below one ulp. Resolving to the shape it is numerically
+    /// indistinguishable from is a *documented, tested* collapse onto an exact limit, unlike the
+    /// clamp it replaces.
+    pub fn emg(k: f64, n_sigma: f64) -> Result<PeakShape, PeakShapeError> {
+        require_finite_nonnegative("n-sigma", n_sigma)?;
+        if !k.is_finite() {
+            return Err(PeakShapeError::NotFinite { name: "emg-k", value: k });
+        }
+        if k < 0.0 {
+            return Err(PeakShapeError::Negative { name: "emg-k", value: k });
+        }
+        if k == 0.0 {
+            return Ok(PeakShape::Gaussian);
+        }
+        match Emg::new(k, n_sigma) {
+            Ok(e) => Ok(PeakShape::Emg(e)),
+            // With k > 0 and n_sigma already screened, the only remaining failure is the underflow
+            // above — the Gaussian limit.
+            Err(_) => Ok(PeakShape::Gaussian),
+        }
+    }
+
+    /// The name this shape is recorded under in output metadata (and accepted under on the CLI).
+    pub fn name(&self) -> &'static str {
+        match self {
+            PeakShape::Gaussian => "gaussian",
+            PeakShape::Emg(_) => "emg",
+        }
+    }
+
+    /// The resolved tailing factor. **`0` for the Gaussian** — which is not a placeholder but the
+    /// exact truth: the Gaussian *is* the `k = 0` member of this family, so `(name, k)` is a
+    /// complete, round-trippable description of the kernel that produced a render.
+    pub fn emg_k(&self) -> f64 {
+        match self {
+            PeakShape::Gaussian => 0.0,
+            PeakShape::Emg(e) => e.k,
+        }
+    }
+}
+
 impl Emg {
     /// Build the shape for tailing factor `k`, truncated at `n_sigma` on the Gaussian side.
     ///
+    /// Prefer [`PeakShape::emg`], which additionally maps the exact `k == 0` limit onto
+    /// [`PeakShape::Gaussian`]. This constructor requires a strictly positive, finite `k`: there is
+    /// no `Emg` for `k = 0`, because that shape is a `Gaussian`.
+    ///
     /// Both derived constants are computed here, once, because both are far too expensive for the
     /// render's inner loop.
-    pub fn new(k: f64, n_sigma: f64) -> Emg {
-        let k = k.max(1e-12); // k = 0 is the Gaussian limit; keep 1/k finite.
+    pub fn new(k: f64, n_sigma: f64) -> Result<Emg, PeakShapeError> {
+        require_finite_positive("emg-k", k)?;
+        require_finite_nonnegative("n-sigma", n_sigma)?;
 
         // The mode, by golden-section search on the (unimodal) standardised PDF. The mode of an EMG
-        // lies between mu and the mean mu + 1/lambda (z = k), so [-1, k+1] brackets it with room.
-        let (mut lo, mut hi) = (-1.0f64, k + 1.0);
+        // lies between mu and the mean mu + 1/lambda (z = k), so [-1, k+1] brackets it.
+        //
+        // For a LARGE k that bracket is useless: golden section shrinks the interval by
+        // 0.618^200 ~ 1.8e-42 per run, so on [-1, 1e100] it resolves the mode only to ~1e58, and the
+        // "mode offset" it returns is then large enough to make `elution_half_widths` cancel to
+        // nonsense. A second, tighter bound closes that. At the mode, `phi(u)/Phi(u) = 1/k` with
+        // `u = mode - 1/k`; `Phi(u) >= 1/2` for `u >= 0` forces `phi(u) >= 1/(2k)`, hence
+        // `u <= sqrt(2 ln k)`. Take whichever bound is smaller — both are valid, and the tighter one
+        // caps the bracket at ~25 for every k the type can hold.
+        //
+        // This is inert for k <= 1 (the min picks `k + 1`), so v1's default k = 10/21 keeps the
+        // bracket, and the mode offset, it has always had.
+        let mut hi = k + 1.0;
+        if k > 1.0 {
+            hi = hi.min((2.0 * k.ln()).sqrt() + 1.0 / k + 2.0);
+        }
+        let mut lo = -1.0f64;
         const INV_PHI: f64 = 0.618_033_988_749_894_9;
         let (mut c, mut d) = (hi - (hi - lo) * INV_PHI, lo + (hi - lo) * INV_PHI);
         let (mut fc, mut fd) = (emg_pdf_std(c, k), emg_pdf_std(d, k));
@@ -220,14 +397,64 @@ impl Emg {
             }
         }
         let mode_offset = 0.5 * (lo + hi);
+        let peak_pdf = emg_pdf_std(mode_offset, k);
 
-        // Right-tail reach. The Gaussian truncation at n_sigma leaves p = 0.5*erfc(n_sigma/sqrt2) of
-        // the mass outside; the exponential tail (time constant k, in units of sigma) falls to that
-        // same fraction after k*ln(1/p). Matching the two keeps `--n-sigma` meaning what it meant.
+        // Right-tail reach: INVERT THE SURVIVAL FUNCTION, don't approximate it.
+        //
+        // The Gaussian truncation at n_sigma leaves p = 0.5*erfc(n_sigma/sqrt2) of the mass beyond
+        // the right edge, so keeping `--n-sigma` meaning what it always meant means putting the
+        // EMG's right edge where the EMG *itself* leaves p behind — i.e. solving
+        // `S(n_sigma + tail_reach) = p` for the real [`emg_sf_std`].
+        //
+        // The first cut used the exponential-tail asymptote `tail_reach = k*ln(1/p)`, which is only
+        // the leading term of that solution: exact as `k -> inf`, and progressively loose below,
+        // where it also has to lean on the mode shift to stay conservative. That made
+        // "> 99.7% captured" a claim verifiable only at whichever `k` someone happened to test.
+        // Bisecting the actual `S` makes it true for EVERY k by construction, and it costs one
+        // O(160) loop per RENDER — not per ion, not per frame — so there is no reason to
+        // approximate. The left edge is unchanged at z = -n_sigma, where the EMG's CDF is bounded
+        // ABOVE by the Gaussian's, so total captured mass >= 1 - 2p for all k.
         let p = 0.5 * erfc_nr(n_sigma / std::f64::consts::SQRT_2);
-        let tail_reach = if p > 0.0 && p < 1.0 { k * (1.0 / p).ln() } else { 0.0 };
+        let tail_reach = if p > 0.0 && p < 1.0 {
+            // S is strictly decreasing in z. The asymptote is the natural first bracket; double
+            // until it actually undershoots p, which caps the search regardless of how loose it is.
+            let (mut a, mut b) = (n_sigma, n_sigma + k * (1.0 / p).ln() + 1.0);
+            let mut guard = 0;
+            while b.is_finite() && emg_sf_std(b, k) > p && guard < 60 {
+                b = n_sigma + (b - n_sigma) * 2.0;
+                guard += 1;
+            }
+            if !b.is_finite() || emg_sf_std(b, k) > p {
+                // Unreachable for a finite k (S decays like exp(-z/k)); fall back to the asymptote
+                // rather than ever hand the render a NaN half-width.
+                k * (1.0 / p).ln()
+            } else {
+                for _ in 0..100 {
+                    let m = 0.5 * (a + b);
+                    if emg_sf_std(m, k) > p { a = m } else { b = m }
+                }
+                // Take `b`, the endpoint that is KNOWN to satisfy S <= p, so the captured-mass
+                // guarantee is one-sided rather than "true to within a bisection step".
+                (b - n_sigma).max(0.0)
+            }
+        } else {
+            0.0
+        };
 
-        Emg { k, mode_offset, tail_reach, peak_pdf: emg_pdf_std(mode_offset, k) }
+        if !(mode_offset.is_finite() && tail_reach.is_finite() && peak_pdf.is_finite() && peak_pdf > 0.0) {
+            // Only reachable for subnormal k, where 1/k overflows and the tail term underflows to
+            // zero — i.e. where the EMG *is* the Gaussian to within an ulp. [`PeakShape::emg`] turns
+            // this into `PeakShape::Gaussian`; surfacing it as an error here keeps `Emg` a type
+            // every inhabitant of which has finite, usable constants.
+            return Err(PeakShapeError::NotFinite { name: "emg-k", value: k });
+        }
+
+        Ok(Emg { k, mode_offset, tail_reach, peak_pdf })
+    }
+
+    /// The tailing factor this shape was built with.
+    pub fn k(&self) -> f64 {
+        self.k
     }
 
     /// Where this shape's peak sits relative to `mu`, in units of sigma — v1's `mode - mu`.
@@ -242,7 +469,11 @@ impl Emg {
         // v1 anchors on the mode and solves for mu; here mu = apex - sigma*mode_offset, so the
         // standardised coordinate is z = (x - mu)/sigma = (x - apex)/sigma + mode_offset.
         let z = |x: f64| (x - apex) / sigma + self.mode_offset;
-        emg_cdf_std(z(b), self.k) - emg_cdf_std(z(a), self.k)
+        // `max(0.0)`: F is mathematically monotone, but it is evaluated through a rational
+        // approximation with ~1e-9 noise, so two nearby z can invert by an ulp and hand the render a
+        // NEGATIVE bin mass. The clamp is a no-op wherever the difference is resolvable at all, and
+        // removes the pathology where it is not.
+        (emg_cdf_std(z(b), self.k) - emg_cdf_std(z(a), self.k)).max(0.0)
     }
 }
 
@@ -906,7 +1137,7 @@ mod tests {
 
         let mut last_ratio = 1.0;
         for &k in &[0.25, V1_DEFAULT_EMG_K, 1.5] {
-            let e = PeakShape::Emg(Emg::new(k, 3.0));
+            let e = PeakShape::emg(k, 3.0).unwrap();
             let (l, r) = (mass(&e, apex - 400.0, apex), mass(&e, apex, apex + 400.0));
             assert!(r > l, "k={k}: EMG must carry more mass right of the apex ({r} vs {l})");
             let ratio = r / l;
@@ -922,7 +1153,7 @@ mod tests {
         let sigma = 30.0;
         let apex = 500.0;
         for &k in &[0.1, V1_DEFAULT_EMG_K, 3.0] {
-            let e = PeakShape::Emg(Emg::new(k, 3.0));
+            let e = PeakShape::emg(k, 3.0).unwrap();
             let at_apex = elution_frac(apex - 0.5, apex + 0.5, apex, sigma, &e);
             for d in [-90.0, -30.0, -5.0, -1.0, 1.0, 5.0, 30.0, 90.0] {
                 let off = elution_frac(apex + d - 0.5, apex + d + 0.5, apex, sigma, &e);
@@ -935,7 +1166,7 @@ mod tests {
     #[test]
     fn emg_window_is_asymmetric_and_captures_the_mass() {
         let (sigma, n_sigma) = (30.0, 3.0);
-        let e = PeakShape::Emg(Emg::new(V1_DEFAULT_EMG_K, n_sigma));
+        let e = PeakShape::emg(V1_DEFAULT_EMG_K, n_sigma).unwrap();
         let (left, right) = elution_half_widths(sigma, n_sigma, &e);
         assert!(right > left, "EMG window must reach further right: {left} / {right}");
         let apex = 10_000.0;
@@ -956,12 +1187,245 @@ mod tests {
             assert_eq!(got.to_bits(), want.to_bits(), "t={t}");
         }
         for &k in &[0.2, V1_DEFAULT_EMG_K, 2.0] {
-            let e = PeakShape::Emg(Emg::new(k, 3.0));
+            let e = PeakShape::emg(k, 3.0).unwrap();
             let top = elution_ordinate(apex, apex, sigma, &e);
             assert!((top - 1.0).abs() < 1e-9, "k={k}: apex height {top} != 1");
             for d in [-20.0, -3.0, 3.0, 20.0] {
                 assert!(elution_ordinate(apex + d, apex, sigma, &e) <= top, "k={k} d={d}");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Input validation and the k/z domain
+    //
+    // The tests above sample k in 0.05..9.5 — the band a real chromatogram lives in. These sample
+    // the band a USER can type, which is all of f64. Every one of these inputs previously produced
+    // either a silently different shape or a NaN on disk.
+    // -----------------------------------------------------------------------------------------
+
+    /// A `k` grid spanning the whole constructible range: the exact Gaussian limit, subnormals, the
+    /// realistic band, and values large enough to make the tail longer than any real gradient.
+    const K_GRID: &[f64] = &[
+        0.0,
+        5e-324,             // the smallest subnormal — 1/k overflows
+        f64::MIN_POSITIVE,  // 2.2e-308 — 1/k is finite but the tail term underflows
+        1e-300,
+        1e-30,
+        1e-12,
+        1e-6,
+        1e-3,
+        0.05,
+        0.25,
+        V1_DEFAULT_EMG_K,
+        1.0,
+        2.0,
+        9.5,
+        50.0,
+        1e3,
+        1e6,
+        1e12,
+        1e100,
+        1e300,
+    ];
+
+    /// A `z` grid reaching far past anything a render produces, in both directions.
+    const Z_GRID: &[f64] = &[
+        -1e300, -1e50, -1e8, -1e4, -300.0, -40.0, -9.0, -3.0, -1.0, -0.25, 0.0, 0.25, 1.0, 3.0,
+        9.0, 40.0, 300.0, 1e4, 1e8, 1e50, 1e300,
+    ];
+
+    /// Non-finite and negative `k` must be REFUSED, not absorbed.
+    ///
+    /// `Emg::new` used to run every one of these through `k.max(1e-12)`. For `-1.0` that silently
+    /// substituted a near-Gaussian; for `NaN`, `f64::max` returns the *other* operand, so `NaN` also
+    /// became `1e-12` — a shape the user never asked for, rendered without a word. `+inf` was worse:
+    /// it survived the clamp, made the golden-section bracket `[-1, inf]` (so `c` and `d` are `NaN`)
+    /// and put `NaN` half-widths and `NaN` weights on disk.
+    #[test]
+    fn invalid_k_is_rejected_not_clamped() {
+        for &bad in &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(PeakShape::emg(bad, 3.0), Err(PeakShapeError::NotFinite { .. })), "k={bad}");
+            assert!(matches!(Emg::new(bad, 3.0), Err(PeakShapeError::NotFinite { .. })), "k={bad}");
+        }
+        for &bad in &[-1e-30, -0.5, -1.0, -1e300] {
+            assert!(matches!(PeakShape::emg(bad, 3.0), Err(PeakShapeError::Negative { .. })), "k={bad}");
+        }
+        // -0.0 == 0.0 in IEEE, and it is the zero-limit, not a negative number.
+        assert_eq!(PeakShape::emg(-0.0, 3.0).unwrap(), PeakShape::Gaussian);
+    }
+
+    /// `k == 0` must be the Gaussian VARIANT — the advertised limit taken exactly, so it is
+    /// bit-identical to `--peak-shape gaussian` rather than merely close to it.
+    #[test]
+    fn k_zero_is_exactly_the_gaussian_variant() {
+        for &n_sigma in &[0.0, 1.0, 3.0, 12.0] {
+            let s = PeakShape::emg(0.0, n_sigma).unwrap();
+            assert_eq!(s, PeakShape::Gaussian, "k=0 at n_sigma={n_sigma}");
+            // ...and therefore bit-identical to the pre-EMG kernel, not just numerically similar.
+            for i in -40..40 {
+                let f = i as f64 * 0.37;
+                assert_eq!(
+                    elution_frac(f - 0.5, f + 0.5, 4.25, 2.5, &s).to_bits(),
+                    gauss_frac(f - 0.5, f + 0.5, 4.25, 2.5).to_bits(),
+                    "k=0 must BE gauss_frac at f={f}"
+                );
+            }
+            assert_eq!(elution_half_widths(30.0, n_sigma, &s), (n_sigma * 30.0, n_sigma * 30.0));
+        }
+        // There is no `Emg` for k = 0: that shape is a `Gaussian`.
+        assert!(matches!(Emg::new(0.0, 3.0), Err(PeakShapeError::NotPositive { .. })));
+    }
+
+    /// Subnormal `k` is the same limit at the edge of the type — and must not produce `NaN`.
+    ///
+    /// Below `k ~ 5.6e-309`, `1/k` overflows to `+inf`, the tail term underflows to `0`, and the
+    /// peak-height normaliser `emg_pdf_std(mode)/peak_pdf` becomes `0/0`. Resolving to the Gaussian
+    /// is exact to within an ulp *and* keeps the ordinate finite.
+    #[test]
+    fn subnormal_k_resolves_to_the_gaussian_without_nan() {
+        for &k in &[5e-324, 1e-320, 1e-310] {
+            let s = PeakShape::emg(k, 3.0).unwrap();
+            assert_eq!(s, PeakShape::Gaussian, "k={k:e} must degenerate, not produce NaN");
+            assert!(elution_ordinate(0.5, 0.0, 1.0, &s).is_finite());
+        }
+        // Just ABOVE the underflow the EMG is real, and still finite everywhere.
+        let s = PeakShape::emg(1e-300, 3.0).unwrap();
+        assert!(matches!(s, PeakShape::Emg(_)), "k=1e-300 is still a constructible EMG");
+        assert!(elution_ordinate(0.5, 0.0, 1.0, &s).is_finite());
+    }
+
+    /// Across the FULL k × z grid: every fraction and every ordinate must be finite and >= 0.
+    ///
+    /// A negative weight is not a rounding curiosity — the render multiplies it by an abundance and
+    /// deposits it, so it would subtract ion current from a bin. A NaN weight poisons the whole
+    /// frame buffer.
+    #[test]
+    fn fractions_and_ordinates_are_finite_and_non_negative_everywhere() {
+        for &k in K_GRID {
+            let shape = PeakShape::emg(k, 3.0).expect("every k in K_GRID is constructible");
+            for &z in Z_GRID {
+                // sigma = 1, apex = 0, so the bin [z - 0.5, z + 0.5] is directly in z units.
+                let frac = elution_frac(z - 0.5, z + 0.5, 0.0, 1.0, &shape);
+                assert!(frac.is_finite(), "k={k:e} z={z:e}: non-finite fraction {frac}");
+                assert!(frac >= 0.0, "k={k:e} z={z:e}: negative fraction {frac}");
+                assert!(frac <= 1.0 + 1e-9, "k={k:e} z={z:e}: fraction {frac} exceeds 1");
+
+                let ord = elution_ordinate(z, 0.0, 1.0, &shape);
+                assert!(ord.is_finite(), "k={k:e} z={z:e}: non-finite ordinate {ord}");
+                assert!(ord >= 0.0, "k={k:e} z={z:e}: negative ordinate {ord}");
+                assert!(ord <= 1.0 + 1e-9, "k={k:e} z={z:e}: ordinate {ord} exceeds the apex height");
+            }
+            // The derived window must be usable too — a NaN half-width empties the active set
+            // silently, which is how this class of bug reaches disk.
+            let (l, r) = elution_half_widths(30.0, 3.0, &shape);
+            assert!(l.is_finite() && r.is_finite() && l >= 0.0 && r >= 0.0, "k={k:e}: widths {l} / {r}");
+        }
+    }
+
+    /// The CDF stays a CDF across the whole k grid, and the survival function is its exact complement
+    /// wherever both are resolvable.
+    #[test]
+    fn cdf_and_survival_agree_across_the_k_grid() {
+        for &k in K_GRID {
+            if k == 0.0 {
+                continue; // k = 0 has no `Emg`; its CDF is `gauss_frac`'s, tested separately.
+            }
+            let mut prev = -1.0;
+            for &z in Z_GRID {
+                let c = emg_cdf_std(z, k);
+                let s = emg_sf_std(z, k);
+                assert!(c.is_finite() && s.is_finite(), "k={k:e} z={z:e}: cdf {c} sf {s}");
+                // Tolerance 3e-7: the shared Numerical-Recipes `erfc` is itself only good to ~1.2e-7
+                // (`erfc(0)` comes back as 1.00000003), so a probability can overshoot by that much.
+                assert!((-3e-7..=1.0 + 3e-7).contains(&c), "k={k:e} z={z:e}: cdf {c} out of [0,1]");
+                assert!((-3e-7..=1.0 + 3e-7).contains(&s), "k={k:e} z={z:e}: sf {s} out of [0,1]");
+                assert!(c >= prev - 1e-12, "k={k:e}: cdf not monotone at z={z:e}");
+                prev = c;
+                // `3e-7`, not `1e-9`: both sides run through the Numerical-Recipes `erfc`, whose own
+                // accuracy is ~1.2e-7 (it returns 1.00000003 for `erfc(0)`). This bounds the
+                // ALGEBRA — that `emg_sf_std` really is `1 - emg_cdf_std` rewritten — not the
+                // approximation, which is v1's and is deliberately shared.
+                assert!((c + s - 1.0).abs() < 3e-7, "k={k:e} z={z:e}: cdf+sf = {}", c + s);
+            }
+        }
+    }
+
+    /// **The truncation guarantee, across the whole grid — not at one k.**
+    ///
+    /// This is what the survival-function inversion bought. The right edge sits where the EMG's own
+    /// `S` equals the Gaussian's `p = 0.5*erfc(n_sigma/sqrt2)`, and the left edge sits at `z =
+    /// -n_sigma`, where the EMG's CDF is bounded above by the Gaussian's. So captured mass
+    /// `>= 1 - 2p` for EVERY constructible k, by construction rather than by luck at the one k the
+    /// old `k*ln(1/p)` asymptote was checked at.
+    #[test]
+    fn truncation_window_captures_the_promised_mass_for_every_k() {
+        for &n_sigma in &[2.0, 3.0, 4.0, 6.0] {
+            let p = 0.5 * erfc_nr(n_sigma / std::f64::consts::SQRT_2);
+            let floor = 1.0 - 2.0 * p;
+            for &k in K_GRID {
+                let shape = PeakShape::emg(k, n_sigma).unwrap();
+                let (sigma, apex) = (30.0, 1.0e5);
+                let (left, right) = elution_half_widths(sigma, n_sigma, &shape);
+                let captured = elution_frac(apex - left, apex + right, apex, sigma, &shape);
+                // 5e-7 of slack: the floor is computed through the NR `erfc` (~1.2e-7) while the
+                // Gaussian arm measures the captured mass through the A&S `erf` (~1.5e-7), so the
+                // two disagree by that much before any shape question is asked.
+                assert!(
+                    captured >= floor - 5e-7,
+                    "k={k:e} n_sigma={n_sigma}: window keeps {captured}, promised >= {floor}"
+                );
+                // The half-widths are measured from the APEX (the mode), and for small k the mode
+                // itself has shifted right by ~k*sigma — so `right > left` is a property of a
+                // VISIBLY tailed peak, not an invariant of the window (at k -> 0 the two converge
+                // and cross). The invariant that does hold for every k is the one the window is
+                // built from, stated in z (i.e. relative to mu): the left edge sits exactly at
+                // -n_sigma, and the right edge never falls INSIDE the Gaussian's n_sigma.
+                if let PeakShape::Emg(e) = shape {
+                    let left_edge_z = e.mode_offset() - left / sigma;
+                    let right_edge_z = e.mode_offset() + right / sigma;
+                    assert!(
+                        (left_edge_z + n_sigma).abs() < 1e-9,
+                        "k={k:e} n_sigma={n_sigma}: left edge at z={left_edge_z}, expected -{n_sigma}"
+                    );
+                    assert!(
+                        right_edge_z >= n_sigma - 1e-9,
+                        "k={k:e} n_sigma={n_sigma}: right edge at z={right_edge_z} is inside the Gaussian's {n_sigma}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The elution widths every renderer shares are policed by ONE validator, and it rejects the
+    /// whole family of bad inputs rather than the one or two a given binary remembered to check.
+    #[test]
+    fn elution_width_validation_is_uniform() {
+        assert!(validate_elution_widths("sigma-frames", 30.0, 3.0).is_ok());
+        assert!(validate_elution_widths("sigma-frames", 1e-9, 0.0).is_ok());
+        for &bad_sigma in &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                validate_elution_widths("sigma-frames", bad_sigma, 3.0),
+                Err(PeakShapeError::NotFinite { name: "sigma-frames", .. })
+            ));
+        }
+        for &bad_sigma in &[0.0, -1.0] {
+            assert!(matches!(
+                validate_elution_widths("sigma-frames", bad_sigma, 3.0),
+                Err(PeakShapeError::NotPositive { name: "sigma-frames", .. })
+            ));
+        }
+        for &bad_n in &[f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                validate_elution_widths("sigma-frames", 30.0, bad_n),
+                Err(PeakShapeError::NotFinite { name: "n-sigma", .. })
+            ));
+            // ...and the shape constructor screens it too, so neither order of checks lets it slip.
+            assert!(matches!(PeakShape::emg(1.0, bad_n), Err(PeakShapeError::NotFinite { name: "n-sigma", .. })));
+        }
+        assert!(matches!(
+            validate_elution_widths("sigma-seconds", 3.0, -1.0),
+            Err(PeakShapeError::Negative { name: "n-sigma", .. })
+        ));
     }
 }

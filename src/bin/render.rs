@@ -371,13 +371,13 @@ enum PeakShapeArg {
 }
 
 impl PeakShapeArg {
-    fn resolve(self, emg_k: f64, n_sigma: f64) -> timsim_cli::render::PeakShape {
-        match self {
+    /// Fallible: `--emg-k` is user input, and a `NaN`/negative/infinite `k` used to be absorbed into
+    /// a silently different shape rather than refused. See `timsim_cli::render::PeakShape::emg`.
+    fn resolve(self, emg_k: f64, n_sigma: f64) -> Result<timsim_cli::render::PeakShape> {
+        Ok(match self {
             PeakShapeArg::Gaussian => timsim_cli::render::PeakShape::Gaussian,
-            PeakShapeArg::Emg => {
-                timsim_cli::render::PeakShape::Emg(timsim_cli::render::Emg::new(emg_k, n_sigma))
-            }
-        }
+            PeakShapeArg::Emg => timsim_cli::render::PeakShape::emg(emg_k, n_sigma)?,
+        })
     }
 }
 
@@ -386,6 +386,11 @@ fn main() -> Result<()> {
     if !(a.intensity_scale.is_finite() && a.intensity_scale > 0.0) {
         return Err(anyhow!("--intensity-scale must be finite and > 0, got {}", a.intensity_scale));
     }
+    // The elution knobs, policed identically in all four renderers (`timsim-render`, `-bench`,
+    // `-thermo`, `-sciex`) by the one shared validator. Both sigmas are checked: `sigma_scans` feeds
+    // the mobility Gaussian, which has exactly the same NaN-propagates-to-disk failure mode.
+    timsim_cli::render::validate_elution_widths("sigma-frames", a.sigma_frames, a.n_sigma)?;
+    timsim_cli::render::validate_elution_widths("sigma-scans", a.sigma_scans, a.n_sigma)?;
     // Pre-flight memory admission, BEFORE anything touches rayon (so `build_global` still owns the
     // global pool). Only the DIA parallel render is modelled — that is where the measurements come
     // from — and reducing the thread count cannot change the output, by the same purity argument that
@@ -450,7 +455,7 @@ fn main() -> Result<()> {
         sigma_frames: a.sigma_frames,
         sigma_scans: a.sigma_scans,
         n_sigma: a.n_sigma,
-        shape: a.peak_shape.resolve(a.emg_k, a.n_sigma),
+        shape: a.peak_shape.resolve(a.emg_k, a.n_sigma)?,
     };
 
     // peptide_id -> rt_index.
@@ -602,6 +607,12 @@ fn main() -> Result<()> {
         next_fid += 1;
     }
     writer.finalize().map_err(|e| anyhow!("{e}"))?;
+    // Record WHICH elution kernel produced this `.d`, into the `.d` itself. Before this, a Gaussian
+    // render and an EMG render were indistinguishable from their own outputs, so a cached artifact
+    // could not be identified as stale by anything except re-running the render. See
+    // `timsim_cli::provenance`. Stamped after `finalize` because the writer owns the table until it
+    // closes the file; it touches `analysis.tdf` only, never `analysis.tdf_bin`.
+    timsim_cli::provenance::stamp_tdf(&a.out, &g.shape, g.n_sigma).map_err(|e| anyhow!("{e}"))?;
     println!(
         "  wrote {} frames, {} MS1 peaks ({} calibration) -> {}",
         a.n_frames, total_peaks,
@@ -1314,6 +1325,12 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
     }).collect();
     writer.set_dda_schedule(precursors, pasef);
     writer.finalize().map_err(|e| anyhow!("{e}"))?;
+    // Record WHICH elution kernel produced this `.d`, into the `.d` itself. Before this, a Gaussian
+    // render and an EMG render were indistinguishable from their own outputs, so a cached artifact
+    // could not be identified as stale by anything except re-running the render. See
+    // `timsim_cli::provenance`. Stamped after `finalize` because the writer owns the table until it
+    // closes the file; it touches `analysis.tdf` only, never `analysis.tdf_bin`.
+    timsim_cli::provenance::stamp_tdf(&a.out, &g.shape, g.n_sigma).map_err(|e| anyhow!("{e}"))?;
 
     // Sidecar answer key: one row per selection EVENT, keyed on (ms2_frame, scan_begin).
     {
@@ -1331,7 +1348,12 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             ch.push(e.charge); iso.push(e.isolation_mz); mo.push(e.mono_mz);
             pa.push(e.parent_ms1_frame); it.push(e.event_intensity); rtc.push(io.apex_frame * a.cycle_seconds);
         }
-        let schema = Arc::new(Schema::new(vec![
+        // The answer key self-identifies its elution kernel: `truth.parquet` used to be BYTE-IDENTICAL
+        // between a Gaussian and an EMG render, so a scored result could not be traced back to the
+        // shape that produced it. Arrow schema metadata, so `timsim_schema::metadata()` — the reader
+        // the pipeline already uses for `peptide_rt` — picks it up. Footer only: the data pages are
+        // unchanged. See `timsim_cli::provenance`.
+        let schema = Arc::new(Schema::new_with_metadata(vec![
             Field::new("ms2_frame", DataType::Int64, false),
             Field::new("scan_begin", DataType::Int64, false),
             Field::new("scan_end", DataType::Int64, false),
@@ -1344,7 +1366,9 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             Field::new("parent_ms1_frame", DataType::Int64, false),
             Field::new("event_intensity", DataType::Float64, false),
             Field::new("rt_seconds", DataType::Float64, false),
-        ]));
+        ],
+            timsim_cli::provenance::schema_metadata(&g.shape, g.n_sigma),
+        ));
         let batch = RecordBatch::try_new(schema.clone(), vec![
             Arc::new(Int64Array::from(fr)), Arc::new(Int64Array::from(sb)), Arc::new(Int64Array::from(se)),
             Arc::new(Int64Array::from(td)), Arc::new(UInt64Array::from(pc)), Arc::new(UInt64Array::from(pe)),
@@ -1810,6 +1834,12 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         next_fid += 1;
     }
     writer.finalize().map_err(|e| anyhow!("{e}"))?;
+    // Record WHICH elution kernel produced this `.d`, into the `.d` itself. Before this, a Gaussian
+    // render and an EMG render were indistinguishable from their own outputs, so a cached artifact
+    // could not be identified as stale by anything except re-running the render. See
+    // `timsim_cli::provenance`. Stamped after `finalize` because the writer owns the table until it
+    // closes the file; it touches `analysis.tdf` only, never `analysis.tdf_bin`.
+    timsim_cli::provenance::stamp_tdf(&a.out, &g.shape, g.n_sigma).map_err(|e| anyhow!("{e}"))?;
     println!("  wrote {} frames ({} MS1 + {} MS2 peaks) -> {}", a.n_frames, ms1_peaks, ms2_peaks, a.out.display());
 
     // Answer key: per-precursor DIA truth, the SAME 8-column schema render_thermo writes — so the eval
@@ -1845,7 +1875,12 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 && m.scan <= w.scan_num_end as f64));
         }
         let n = pc.len();
-        let schema = Arc::new(Schema::new(vec![
+        // The answer key self-identifies its elution kernel: `truth.parquet` used to be BYTE-IDENTICAL
+        // between a Gaussian and an EMG render, so a scored result could not be traced back to the
+        // shape that produced it. Arrow schema metadata, so `timsim_schema::metadata()` — the reader
+        // the pipeline already uses for `peptide_rt` — picks it up. Footer only: the data pages are
+        // unchanged. See `timsim_cli::provenance`.
+        let schema = Arc::new(Schema::new_with_metadata(vec![
             Field::new("precursor_id", DataType::UInt64, false),
             Field::new("peptide_id", DataType::UInt64, false),
             Field::new("charge", DataType::Int64, false),
@@ -1854,7 +1889,9 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             Field::new("abundance", DataType::Float64, false),
             Field::new("has_ms2", DataType::Boolean, false),
             Field::new("in_any_window", DataType::Boolean, false),
-        ]));
+        ],
+            timsim_cli::provenance::schema_metadata(&g.shape, g.n_sigma),
+        ));
         let batch = RecordBatch::try_new(schema.clone(), vec![
             Arc::new(U64::from(pc)), Arc::new(U64::from(pe)), Arc::new(Int64Array::from(ch)),
             Arc::new(F64::from(mo)), Arc::new(F64::from(rtc)), Arc::new(F64::from(ab)),
