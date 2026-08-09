@@ -20,6 +20,10 @@ use std::sync::Arc;
 /// DIA schedule replay + diagonal transmission — only when the `tdf` feature pulls mscore/rustdf.
 #[cfg(feature = "tdf")]
 pub mod dia;
+/// dia-PASEF per-precursor collision energy, read out of the reference `.d`'s window table through
+/// v1's own `TimsTofCollisionEnergyDIA`. Needs the `tdf` feature (ms-io window tables, mscore lookup).
+#[cfg(feature = "tdf")]
+pub mod dia_ce;
 pub mod dda;
 /// Pre-flight memory admission for the parallel render (cgroup/MemAvailable aware).
 pub mod memguard;

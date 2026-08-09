@@ -36,6 +36,19 @@ impl DiaSchedule {
         Self::build(&info, windows, n_frames, n_scans)
     }
 
+    /// Read a reference DIA `.d`'s schedule and replay exactly ONE acquisition cycle.
+    ///
+    /// The schedule is periodic, so one cycle already contains every distinct `(window group, scan)`
+    /// an ion can ever be transmitted in. A caller that only needs to ask *which window isolates this
+    /// precursor* — `timsim-frag-ce --dia` — wants this rather than materialising a whole run's frame
+    /// list to answer a question that repeats every cycle.
+    pub fn one_cycle_from_reference(ref_d: &str, n_scans: u32) -> Result<Self> {
+        let info = read_dia_ms_ms_info(ref_d).map_err(|e| anyhow!("read DiaFrameMsMsInfo: {e}"))?;
+        let windows = read_dia_ms_ms_windows(ref_d).map_err(|e| anyhow!("read DiaFrameMsMsWindows: {e}"))?;
+        let (cycle_len, _) = extract_cycle(&info)?;
+        Self::build(&info, windows, cycle_len, n_scans)
+    }
+
     /// Build the schedule from already-read reference tables (the unit-testable core).
     pub fn build(
         info: &[DiaMsMisInfo],
