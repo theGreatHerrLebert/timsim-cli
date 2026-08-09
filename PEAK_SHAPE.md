@@ -350,6 +350,25 @@ diffing full `sqlite3 .dump` output, and its hash is pinned too so the stamp can
 `tests/golden/regenerate.sh` re-derives all of it, including building the parent commit in its own
 worktree and target dir.
 
+**Running it: set `TIMSIM_GOLDEN=1` on a machine that holds the fixtures.**
+
+```sh
+cargo build --release --features tdf,thermo,sciex     # the golden shells out to the release binaries
+TIMSIM_GOLDEN=1 cargo test --features tdf,thermo,sciex --test golden_gaussian
+```
+
+The fixtures are machine-local paths — a 12,228-precursor feature space, a 5,692-frame reference `.d`,
+a real Astral template — so the test has two modes, and the split matters:
+
+* **A drift always fails.** If a case runs, its hashes must match. That is not environment-dependent.
+* **Having nothing to run** is a failure only under `TIMSIM_GOLDEN=1`, where absent fixtures mean a
+  provisioning bug. Without it the test prints `GOLDEN: 0/4 combinations checked` and returns green.
+
+Neither hardcoding works. Always-failing makes `cargo test` red on every machine but this one, and a
+permanently red suite is one nobody reads; always-passing turns a vanished fixture into silent loss of
+coverage. The env var is what carries "these fixtures are supposed to be here", and it is the thing to
+set in CI once the fixtures are provisioned there.
+
 **Not exercised, and why:**
 
 * **SCIEX native `.wiff`** — no `.wiff` writer exists in this repo or is reachable from it

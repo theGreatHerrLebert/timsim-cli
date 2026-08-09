@@ -89,7 +89,13 @@ pub enum PeakShape {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Emg {
     /// v1's tailing factor `k = 1 / (sigma * lambda)` = (tail time constant) / sigma.
-    pub k: f64,
+    ///
+    /// PRIVATE, with a [`Emg::k`] accessor: `mode_offset`, `tail_reach` and `peak_pdf` are all
+    /// derived from `k` at construction, so a caller able to assign `k` could leave an `Emg` whose
+    /// constants describe a different shape than its `k` reports — and that `k` is what gets stamped
+    /// into the artifact's provenance. Construction goes through [`PeakShape::emg`] or
+    /// [`Emg::new`], both of which validate.
+    k: f64,
     /// Mode of `EMG(mu = 0, sigma = 1, lambda = 1/k)`, in units of sigma.
     ///
     /// v1 anchors the peak at its **mode** (the RT predictor's output is treated as the apex) and
@@ -235,6 +241,34 @@ pub enum PeakShapeError {
     Negative { name: &'static str, value: f64 },
     /// Zero or negative where `> 0` is required.
     NotPositive { name: &'static str, value: f64 },
+    /// `k` is finite and positive, but subnormal enough that the EMG's derived constants are not
+    /// representable — `1/k` overflows, the tail term underflows — so the shape *is* the Gaussian to
+    /// within an ulp. [`PeakShape::emg`] resolves this to [`PeakShape::Gaussian`].
+    ///
+    /// This has its own variant deliberately. It used to be signalled as `NotFinite` and absorbed by
+    /// a blanket `Err(_) => Ok(Gaussian)`, which meant *any* future failure of [`Emg::new`] would
+    /// silently render a Gaussian — and, now that renders stamp their own kernel, label the artifact
+    /// `gaussian, k = 0` while the caller had asked for an EMG. Naming it lets the one intended
+    /// collapse through and propagates everything else.
+    DegeneratesToGaussian { value: f64 },
+    /// `n_sigma` is so large that the target tail mass `p = 0.5*erfc(n_sigma/sqrt2)` is not a normal
+    /// `f64` — i.e. the truncation this shape promises is not representable at all.
+    ///
+    /// [`Emg::new`] places its right edge by solving `S(edge) = p`. Once `p` stops being normal that
+    /// solve has no usable target, and BOTH degenerate branches are wrong in a way that hides:
+    ///
+    /// * `p` subnormal (`n_sigma` ~ 37.6..38.6): `1/p` overflows, `tail_reach` becomes `inf`, and the
+    ///   finiteness check below reports [`Self::DegeneratesToGaussian`] — announcing that `k` is too
+    ///   small when `k` may be the DEFAULT 10/21, and silently rendering a Gaussian.
+    /// * `p == 0` (`n_sigma` >= ~38.6): `tail_reach` collapses to `0`, truncating the EMG at
+    ///   `n_sigma` with no tail allowance whatsoever. At `k = 1e10, n_sigma = 39` the window then
+    ///   keeps **3.9e-9** of the peak while the guarantee below claims `>= 1 - 2p = 1`.
+    ///
+    /// So the `1 - 2p` guarantee holds on a DOMAIN, and this is that domain's edge, enforced rather
+    /// than documented. Refusing costs nothing real: `n_sigma > 37` is a window 37 standard
+    /// deviations wide, far outside any chromatography, and the alternative is a wrong render that
+    /// certifies itself as correct.
+    TruncationUnrepresentable { n_sigma: f64 },
 }
 
 impl std::fmt::Display for PeakShapeError {
@@ -243,6 +277,16 @@ impl std::fmt::Display for PeakShapeError {
             PeakShapeError::NotFinite { name, value } => write!(f, "--{name} must be finite (got {value})"),
             PeakShapeError::Negative { name, value } => write!(f, "--{name} must be >= 0 (got {value})"),
             PeakShapeError::NotPositive { name, value } => write!(f, "--{name} must be > 0 (got {value})"),
+            PeakShapeError::DegeneratesToGaussian { value } => write!(
+                f,
+                "--emg-k = {value} is too small to represent an EMG (it is the Gaussian limit)"
+            ),
+            PeakShapeError::TruncationUnrepresentable { n_sigma } => write!(
+                f,
+                "--n-sigma = {n_sigma} is too large: the tail mass it truncates at, \
+                 0.5*erfc({n_sigma}/sqrt2), is not a normal f64, so the peak's right edge \
+                 cannot be placed (use --n-sigma <= 37)"
+            ),
         }
     }
 }
@@ -322,9 +366,12 @@ impl PeakShape {
         }
         match Emg::new(k, n_sigma) {
             Ok(e) => Ok(PeakShape::Emg(e)),
-            // With k > 0 and n_sigma already screened, the only remaining failure is the underflow
-            // above — the Gaussian limit.
-            Err(_) => Ok(PeakShape::Gaussian),
+            // ONLY the documented subnormal collapse resolves to a Gaussian. Everything else
+            // propagates: a blanket `Err(_)` here would mean any future failure of `Emg::new`
+            // silently renders a Gaussian and stamps the artifact `gaussian, k = 0` while the caller
+            // asked for an EMG — a wrong kernel that certifies itself as correct.
+            Err(PeakShapeError::DegeneratesToGaussian { .. }) => Ok(PeakShape::Gaussian),
+            Err(e) => Err(e),
         }
     }
 
@@ -413,9 +460,16 @@ impl Emg {
         // Bisecting the actual `S` makes it true for EVERY k by construction, and it costs one
         // O(160) loop per RENDER — not per ion, not per frame — so there is no reason to
         // approximate. The left edge is unchanged at z = -n_sigma, where the EMG's CDF is bounded
-        // ABOVE by the Gaussian's, so total captured mass >= 1 - 2p for all k.
+        // ABOVE by the Gaussian's, so total captured mass >= 1 - 2p for all k -- ON THE DOMAIN WHERE
+        // `p` IS A NORMAL f64, which is what the guard below enforces. Past that edge `p` is not a
+        // number the solve can aim at, and the two ways it degenerates are both silent and both
+        // wrong (see [`PeakShapeError::TruncationUnrepresentable`]). A guarantee with an unstated
+        // domain is how "> 99.7% captured" ends up stamped on a peak holding 3.9e-9 of its mass.
         let p = 0.5 * erfc_nr(n_sigma / std::f64::consts::SQRT_2);
-        let tail_reach = if p > 0.0 && p < 1.0 {
+        if !(p >= f64::MIN_POSITIVE && p < 1.0) {
+            return Err(PeakShapeError::TruncationUnrepresentable { n_sigma });
+        }
+        let tail_reach = {
             // S is strictly decreasing in z. The asymptote is the natural first bracket; double
             // until it actually undershoots p, which caps the search regardless of how loose it is.
             let (mut a, mut b) = (n_sigma, n_sigma + k * (1.0 / p).ln() + 1.0);
@@ -437,8 +491,6 @@ impl Emg {
                 // guarantee is one-sided rather than "true to within a bisection step".
                 (b - n_sigma).max(0.0)
             }
-        } else {
-            0.0
         };
 
         if !(mode_offset.is_finite() && tail_reach.is_finite() && peak_pdf.is_finite() && peak_pdf > 0.0) {
@@ -446,7 +498,11 @@ impl Emg {
             // zero — i.e. where the EMG *is* the Gaussian to within an ulp. [`PeakShape::emg`] turns
             // this into `PeakShape::Gaussian`; surfacing it as an error here keeps `Emg` a type
             // every inhabitant of which has finite, usable constants.
-            return Err(PeakShapeError::NotFinite { name: "emg-k", value: k });
+            //
+            // A DEDICATED variant, not `NotFinite`: `PeakShape::emg` resolves precisely this one to a
+            // Gaussian and propagates anything else, so a future failure mode added here cannot
+            // silently downgrade the kernel behind the caller's back.
+            return Err(PeakShapeError::DegeneratesToGaussian { value: k });
         }
 
         Ok(Emg { k, mode_offset, tail_reach, peak_pdf })
@@ -1277,6 +1333,29 @@ mod tests {
         assert!(matches!(Emg::new(0.0, 3.0), Err(PeakShapeError::NotPositive { .. })));
     }
 
+    /// Only the documented subnormal collapse may downgrade an EMG request to a Gaussian.
+    ///
+    /// This pins the fix for a review finding: `PeakShape::emg` used to absorb EVERY `Emg::new`
+    /// failure into `Ok(Gaussian)`. Because a render now stamps its own kernel into the artifact,
+    /// that would have written `gaussian, k = 0` onto output the caller had asked to be an EMG —
+    /// a wrong kernel certifying itself as correct, which is the exact defect class this module
+    /// exists to prevent.
+    #[test]
+    fn only_the_subnormal_collapse_downgrades_an_emg_to_a_gaussian() {
+        // The one sanctioned collapse: representable, positive, but below the constants' floor.
+        assert!(matches!(Emg::new(5e-324, 3.0), Err(PeakShapeError::DegeneratesToGaussian { .. })));
+        assert_eq!(PeakShape::emg(5e-324, 3.0).unwrap(), PeakShape::Gaussian);
+
+        // Everything else must SURFACE, never silently become a Gaussian.
+        for (k, n_sigma) in [(f64::NAN, 3.0), (f64::INFINITY, 3.0), (-1.0, 3.0), (0.5, f64::NAN), (0.5, -1.0)] {
+            let got = PeakShape::emg(k, n_sigma);
+            assert!(got.is_err(), "emg(k={k}, n_sigma={n_sigma}) must error, got {got:?}");
+        }
+
+        // And a healthy k stays an EMG rather than being quietly rounded away.
+        assert!(matches!(PeakShape::emg(10.0 / 21.0, 3.0).unwrap(), PeakShape::Emg(_)));
+    }
+
     /// Subnormal `k` is the same limit at the edge of the type — and must not produce `NaN`.
     ///
     /// Below `k ~ 5.6e-309`, `1/k` overflows to `+inf`, the tail term underflows to `0`, and the
@@ -1358,9 +1437,16 @@ mod tests {
     /// -n_sigma`, where the EMG's CDF is bounded above by the Gaussian's. So captured mass
     /// `>= 1 - 2p` for EVERY constructible k, by construction rather than by luck at the one k the
     /// old `k*ln(1/p)` asymptote was checked at.
+    ///
+    /// **On the domain where `p` is a normal `f64`** — `n_sigma` up to ~37.5. That bound is not a
+    /// caveat bolted onto the claim; it is enforced by [`Emg::new`], and
+    /// [`truncation_guarantee_is_enforced_at_the_edge_of_its_domain`] is the half of this test that
+    /// checks the OTHER side of the boundary.
     #[test]
     fn truncation_window_captures_the_promised_mass_for_every_k() {
-        for &n_sigma in &[2.0, 3.0, 4.0, 6.0] {
+        // The top of the grid is deliberately just inside the representable-`p` edge: a guarantee
+        // tested only at n_sigma <= 6 says nothing about where it actually stops holding.
+        for &n_sigma in &[2.0, 3.0, 4.0, 6.0, 20.0, 37.0] {
             let p = 0.5 * erfc_nr(n_sigma / std::f64::consts::SQRT_2);
             let floor = 1.0 - 2.0 * p;
             for &k in K_GRID {
@@ -1397,6 +1483,48 @@ mod tests {
         }
     }
 
+    /// **The other side of that domain**: past it, `Emg::new` must REFUSE, not degrade.
+    ///
+    /// Both degenerate branches used to be silent, and both produced a wrong render that labelled
+    /// itself correct — the exact defect class the provenance stamp exists to prevent:
+    ///
+    /// * `p` subnormal → `1/p` overflows → `tail_reach = inf` → the finiteness check reported
+    ///   `DegeneratesToGaussian`, i.e. blamed `k` (which may be the DEFAULT 10/21) and rendered a
+    ///   Gaussian stamped `gaussian, 0.0`.
+    /// * `p == 0` → `tail_reach = 0` → the EMG truncated at `n_sigma` with no tail allowance. The
+    ///   `k = 1e10` case below kept **3.9e-9** of the peak while the guarantee promised `>= 1`.
+    #[test]
+    fn truncation_guarantee_is_enforced_at_the_edge_of_its_domain() {
+        // Just inside: still constructible, guarantee still checked by the test above.
+        assert!(Emg::new(10.0 / 21.0, 37.0).is_ok());
+        assert!(Emg::new(1e10, 37.0).is_ok());
+
+        // `p` subnormal. The old code blamed `k` here — note `k` is the DEFAULT.
+        for n_sigma in [37.6, 38.0, 38.5] {
+            let got = Emg::new(10.0 / 21.0, n_sigma);
+            assert!(
+                matches!(got, Err(PeakShapeError::TruncationUnrepresentable { .. })),
+                "n_sigma={n_sigma} must be refused as unrepresentable, got {got:?}"
+            );
+        }
+        // `p == 0`. The old code silently kept a vanishing fraction of the peak.
+        for (k, n_sigma) in [(1e10, 39.0), (1e6, 39.0), (10.0, 40.0), (1.0, 1e300)] {
+            let got = Emg::new(k, n_sigma);
+            assert!(
+                matches!(got, Err(PeakShapeError::TruncationUnrepresentable { .. })),
+                "k={k:e} n_sigma={n_sigma} must be refused, got {got:?}"
+            );
+        }
+
+        // And it must reach the CALLER as a refusal — `PeakShape::emg` resolves only the documented
+        // subnormal-`k` collapse to a Gaussian, so this one may not be absorbed on the way out.
+        let got = PeakShape::emg(10.0 / 21.0, 39.0);
+        assert!(
+            matches!(got, Err(PeakShapeError::TruncationUnrepresentable { .. })),
+            "PeakShape::emg must propagate the refusal, got {got:?}"
+        );
+    }
+
     /// The elution widths every renderer shares are policed by ONE validator, and it rejects the
     /// whole family of bad inputs rather than the one or two a given binary remembered to check.
     #[test]
@@ -1429,3 +1557,4 @@ mod tests {
         ));
     }
 }
+

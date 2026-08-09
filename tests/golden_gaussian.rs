@@ -32,8 +32,14 @@
 //! # Fixtures
 //!
 //! The inputs are machine-local paths (a 12,228-precursor feature space, a 5,692-frame reference
-//! `.d`, a real Astral template). A case whose inputs are absent is skipped with a LOUD, specific
-//! message — and if that leaves nothing to check at all, the test FAILS rather than passing vacuously.
+//! `.d`, a real Astral template) plus release binaries. A case whose inputs are absent is skipped
+//! with a LOUD, specific message naming what was missing.
+//!
+//! **Set `TIMSIM_GOLDEN=1` where those fixtures are supposed to exist.** With it, having nothing to
+//! run is a hard failure (a provisioning bug). Without it, the test reports that it checked nothing
+//! and returns green — because the alternative is a suite that is permanently red on every machine
+//! but one, which is a suite people stop reading. A *drift* fails in both modes: if a case runs, its
+//! hashes must match, and that is not environment-dependent.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -223,11 +229,39 @@ fn gaussian_output_matches_the_pre_emg_binary() {
             w["reason"].as_str().unwrap()
         );
     }
+    // A DRIFT is always a failure: if a case ran at all, its hashes must match. This assert never
+    // depends on the environment, because a mismatch is a real finding wherever it is observed.
     assert!(failures.is_empty(), "Gaussian output drifted:\n  - {}", failures.join("\n  - "));
-    assert!(
-        ran > 0,
-        "the Gaussian golden checked NOTHING — every case was skipped, which is not a pass:\n  - {}",
-        skipped.join("\n  - ")
-    );
+
+    // Whether *having nothing to run* is a failure is a different question, and it has to be
+    // answered by the environment rather than hardcoded either way. Both hardcodings are wrong:
+    //
+    // * always-fail (what this did) makes `cargo test` RED on every machine that is not this
+    //   workstation — the fixtures are machine-local paths to a 12,228-precursor feature space, a
+    //   5,692-frame reference `.d` and a real Astral template. A red suite everyone learns to
+    //   ignore protects nothing, and it would block this crate from being tested anywhere else.
+    // * always-pass turns a vanished fixture into a silent loss of coverage, which is exactly the
+    //   vacuous green the original assert was written to prevent.
+    //
+    // So: strict where the fixtures are supposed to exist (`TIMSIM_GOLDEN=1`), loud-but-green where
+    // they are not. The provisioning story is the env var, and it is stated in the failure message
+    // rather than left for someone to rediscover.
+    let strict = std::env::var_os("TIMSIM_GOLDEN").is_some_and(|v| v != "0");
+    if ran == 0 {
+        let detail = skipped.join("\n  - ");
+        assert!(
+            !strict,
+            "TIMSIM_GOLDEN is set, but the Gaussian golden checked NOTHING — every case was \
+             skipped. On a machine that is supposed to hold the fixtures, that is a provisioning \
+             failure, not a pass:\n  - {detail}"
+        );
+        eprintln!(
+            "GOLDEN: 0/{} combinations checked — no binaries or fixtures on this machine. This is \
+             NOT evidence the Gaussian output is unchanged; it is the absence of evidence. Set \
+             TIMSIM_GOLDEN=1 on a machine holding the fixtures to make this state a hard failure.",
+            m["cases"].as_array().unwrap().len()
+        );
+        return;
+    }
     eprintln!("GOLDEN: {ran}/{} writer/mode combinations verified against parent {parent}", m["cases"].as_array().unwrap().len());
 }

@@ -129,13 +129,38 @@ impl std::error::Error for ProvenanceError {}
 /// for every constructible `s`, which is what `provenance_round_trips` asserts. `gaussian` ignores
 /// `k` (there is nothing else it could be); `emg` goes back through [`PeakShape::emg`], so the
 /// reconstruction runs the same mode search and survival-function inversion the render ran.
+/// `n-sigma` must be a real, non-negative number on EVERY branch of [`parse_shape`], including the
+/// Gaussian one where it is not otherwise consumed.
+fn require_finite_nonnegative_n_sigma(n_sigma: f64) -> Result<(), ProvenanceError> {
+    if !n_sigma.is_finite() {
+        return Err(ProvenanceError::Invalid(PeakShapeError::NotFinite {
+            name: "n-sigma",
+            value: n_sigma,
+        }));
+    }
+    if n_sigma < 0.0 {
+        return Err(ProvenanceError::Invalid(PeakShapeError::Negative {
+            name: "n-sigma",
+            value: n_sigma,
+        }));
+    }
+    Ok(())
+}
+
 pub fn parse_shape(name: &str, k: &str, n_sigma: &str) -> Result<PeakShape, ProvenanceError> {
     let n_sigma: f64 = n_sigma
         .trim()
         .parse()
         .map_err(|_| ProvenanceError::Malformed { key: KEY_N_SIGMA, value: n_sigma.to_string() })?;
     match name.trim() {
-        "gaussian" => Ok(PeakShape::Gaussian),
+        "gaussian" => {
+            // `n_sigma` is part of the truncation record even for a Gaussian, so it must be a usable
+            // number here too. Parsing it and then ignoring it let `("gaussian", <junk>, "nan")` read
+            // back clean, which defeats the point of stamping: a malformed provenance record would
+            // certify itself as valid.
+            require_finite_nonnegative_n_sigma(n_sigma)?;
+            Ok(PeakShape::Gaussian)
+        }
         "emg" => {
             let k: f64 = k
                 .trim()
@@ -242,6 +267,16 @@ mod tests {
         assert!(matches!(parse_shape("emg", "not-a-number", "3"), Err(ProvenanceError::Malformed { .. })));
         assert!(matches!(parse_shape("emg", "1", "nan"), Err(ProvenanceError::Invalid(_))));
         assert!(matches!(parse_shape("emg", "-1", "3"), Err(ProvenanceError::Invalid(_))));
+
+        // The GAUSSIAN branch must validate `n-sigma` too. It ignores `k` (there is nothing else a
+        // Gaussian could do with it), but `n-sigma` is part of the truncation record on both
+        // branches — accepting a NaN there let a malformed stamp read back as a valid one.
+        assert!(matches!(parse_shape("gaussian", "0", "nan"), Err(ProvenanceError::Invalid(_))));
+        assert!(matches!(parse_shape("gaussian", "0", "inf"), Err(ProvenanceError::Invalid(_))));
+        assert!(matches!(parse_shape("gaussian", "0", "-1"), Err(ProvenanceError::Invalid(_))));
+        // ... while a well-formed Gaussian stamp still round-trips.
+        assert_eq!(parse_shape("gaussian", "0", "3").unwrap(), PeakShape::Gaussian);
+
         let empty: HashMap<String, String> = HashMap::new();
         assert!(matches!(
             shape_from_map(&empty, (KEY_PEAK_SHAPE, KEY_EMG_K, KEY_N_SIGMA)),
