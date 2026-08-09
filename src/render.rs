@@ -38,6 +38,259 @@ pub struct Geometry {
     pub sigma_scans: f64,
     /// Truncate each peak at this many sigma (the `target_p` analog).
     pub n_sigma: f64,
+    /// The CHROMATOGRAPHIC peak shape. The mobility (scan) axis is always Gaussian — only the
+    /// elution axis has a tail. See [`PeakShape`].
+    pub shape: PeakShape,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Chromatographic peak shape
+// ---------------------------------------------------------------------------------------------
+
+/// Which shape the **elution** term uses.
+///
+/// # !!! CHANGING THE DEFAULT SILENTLY STALES EVERY CACHED RENDER !!!
+///
+/// The default is [`PeakShape::Emg`] (v1 parity). necroflow fingerprints a node on its **command
+/// string**, and `--peak-shape` defaults to `emg` without appearing in that string — so a render
+/// cached before this change was produced with the OLD symmetric Gaussian and necroflow **cannot
+/// tell**. Cached artifacts under `work/nodes/render_a2/` are stale-but-undetected. They must be
+/// invalidated by hand (or the arm re-rendered with an explicit `--peak-shape` in the command, which
+/// changes the fingerprint and forces a rebuild). See `PEAK_SHAPE.md`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PeakShape {
+    /// Symmetric Gaussian — v2's historical shape, and what every cached render used.
+    Gaussian,
+    /// v1's exponentially modified Gaussian (Gaussian convolved with a one-sided exponential tail).
+    Emg(Emg),
+}
+
+/// v1's EMG, reduced to the one dimensionless parameter the shape actually depends on.
+///
+/// v1 (`mscore::algorithm::utility::emg_function`, driven by
+/// `imspy_simulation/timsim/jobs/simulate_frame_distributions_emg.py`) parameterises the peak as
+/// `(mu, sigma, lambda)` and samples `sigma` and a tailing factor `k` from scaled Beta
+/// distributions, then sets `lambda = 1 / (k * sigma)` (`simulate_frame_distributions_emg.py:287`).
+///
+/// Because `k = 1 / (sigma * lambda)` is **dimensionless**, it carries across v1's seconds axis and
+/// v2's frame axis unchanged — which is why the render can adopt v1's tailing without knowing the
+/// cycle time. Substituting `z = (x - mu) / sigma` collapses the EMG CDF to a function of `z` and
+/// `k` alone (see [`emg_cdf_std`]), so `sigma` stays exactly the width knob it already was
+/// (`--sigma-frames`) and `k` is the only new number.
+///
+/// `k -> 0` is the Gaussian limit (infinitely fast tail decay); larger `k` means a longer tail.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Emg {
+    /// v1's tailing factor `k = 1 / (sigma * lambda)` = (tail time constant) / sigma.
+    pub k: f64,
+    /// Mode of `EMG(mu = 0, sigma = 1, lambda = 1/k)`, in units of sigma.
+    ///
+    /// v1 anchors the peak at its **mode** (the RT predictor's output is treated as the apex) and
+    /// solves backwards for `mu` via `estimate_mu_from_mode_emg`
+    /// (`simulate_frame_distributions_emg.py:146`). The render is handed an `apex_frame`, so it must
+    /// do the same or every peptide elutes systematically late. Precomputed once — the mode search
+    /// must never run in the render's inner loop.
+    mode_offset: f64,
+    /// How far past `n_sigma * sigma` the right-hand truncation must reach to hold as much tail mass
+    /// as the Gaussian leaves beyond `n_sigma`. In units of sigma.
+    tail_reach: f64,
+    /// The standardised PDF's value AT the mode. Divides out in [`elution_ordinate`] so an EMG peak,
+    /// like the Gaussian one, has height exactly 1.0 at its apex.
+    peak_pdf: f64,
+}
+
+/// v1's default tailing factor: the **mean** of the distribution v1 draws `k` from.
+///
+/// v1 samples `k = k_lower + Beta(k_alpha, k_beta) * (k_upper - k_lower)` with
+/// `k_lower_rt = 0`, `k_upper_rt = 10`, `k_alpha_rt = 1`, `k_beta_rt = 20`
+/// (`imspy_simulation/timsim/simulator.py:410-424`, and the shipped `configs/config.toml`), so
+/// `E[k] = 10 * 1/(1+20) = 10/21`.
+///
+/// Cross-check against a measured v1 run on a 1861.3 s gradient: v1's auto-derived width is
+/// `sigma = gradient/3600 * 0.75 + 1.125 = 1.5128 s` and the observed tail constant was 0.72 s,
+/// giving `k = 0.72 / 1.5128 = 0.476` — i.e. exactly 10/21.
+pub const V1_DEFAULT_EMG_K: f64 = 10.0 / 21.0;
+
+/// Numerical-Recipes `erfc`, scaled by `exp(x^2)` — i.e. `erfcx(x) = exp(x^2) * erfc(x)`.
+///
+/// This is **v1's own erf** (`mscore::algorithm::utility::erf`, the same rational/Chebyshev form),
+/// not the Abramowitz-Stegun 7.1.26 used by [`erf`] above. Reusing v1's approximation keeps the EMG
+/// numerics as close to v1's as they can be; the Gaussian path keeps its A&S `erf` untouched so its
+/// output stays bit-for-bit what it always was.
+///
+/// The `exp(x^2)` cancels analytically against the `exp(-x*x - 1.26551223 + ...)` inside the NR
+/// form, so this **cannot overflow** — which is the whole reason the EMG below is written in terms
+/// of `erfcx` rather than `exp(...) * erfc(...)` (that product overflows to `inf * 0 = NaN` in the
+/// left tail, and v1 dodges it only by never evaluating there).
+fn erfcx_nr_nonneg(x: f64) -> f64 {
+    debug_assert!(x >= 0.0);
+    let t = 1.0 / (1.0 + 0.5 * x);
+    t * (-1.26551223
+        + t * (1.00002368
+            + t * (0.37409196
+                + t * (0.09678418
+                    + t * (-0.18628806
+                        + t * (0.27886807
+                            + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
+        .exp()
+}
+
+/// The EMG's tail term, `exp(-z^2/2) * erfcx((1/k - z)/sqrt(2))`, evaluated **as a product** so the
+/// two halves' exponents cancel analytically instead of overflowing.
+///
+/// Writing it as `erfcx(w)` alone is not enough. `erfcx` is only bounded for `w >= 0`; on the far
+/// right of the peak (`z > 1/k`) `w` goes negative and the reflection `erfcx(w) = 2*exp(w^2) -
+/// erfcx(-w)` overflows to `inf` — which the `exp(-z^2/2)` factor then multiplies by zero, giving
+/// `NaN` weights out in the tail. Folding the factor in first turns `exp(w^2 - z^2/2)` into
+/// `exp((1/(2k) - z)/k)`, which for `z > 1/k` is a small number, not an overflow.
+#[inline]
+fn emg_tail_term(z: f64, k: f64) -> f64 {
+    const SQRT2: f64 = std::f64::consts::SQRT_2;
+    let w = (1.0 / k - z) / SQRT2;
+    if w >= 0.0 {
+        (-0.5 * z * z).exp() * erfcx_nr_nonneg(w)
+    } else {
+        2.0 * ((1.0 / (2.0 * k) - z) / k).exp() - (-0.5 * z * z).exp() * erfcx_nr_nonneg(-w)
+    }
+}
+
+/// `erfc` via the same Numerical-Recipes form (used for the Gaussian half of the EMG CDF).
+fn erfc_nr(x: f64) -> f64 {
+    let tau = erfcx_nr_nonneg(x.abs()) * (-x * x).exp();
+    if x >= 0.0 { tau } else { 2.0 - tau }
+}
+
+/// The **standardised** EMG CDF: `P(Z <= z)` for `Z = (X - mu) / sigma` with `lambda = 1/(k*sigma)`.
+///
+/// Derived from v1's PDF (`emg_function`) in closed form rather than v1's 1000-step Riemann sum —
+/// the render evaluates this once per ion per frame, so a quadrature is not affordable. The identity
+/// used is that the EMG satisfies `f' + lambda*f = lambda * phi_sigma(x - mu)`, hence
+///
+/// ```text
+///   F(x) = Phi((x-mu)/sigma) - f(x)/lambda
+/// ```
+///
+/// and, substituting `z` and folding the `exp(x^2)` into `erfcx` (see [`erfcx_nr_nonneg`]),
+///
+/// ```text
+///   F(z) = 0.5 * [ erfc(-z/sqrt2) - exp(-z^2/2) * erfcx((1/k - z)/sqrt2) ]
+/// ```
+///
+/// which is scale-free, overflow-free, and reduces to the Gaussian CDF as `k -> 0`.
+#[inline]
+pub fn emg_cdf_std(z: f64, k: f64) -> f64 {
+    const SQRT2: f64 = std::f64::consts::SQRT_2;
+    let _ = SQRT2;
+    0.5 * (erfc_nr(-z / SQRT2) - emg_tail_term(z, k))
+}
+
+/// Standardised EMG PDF (in `z`), up to the `1/sigma` Jacobian. Only used to locate the mode.
+#[inline]
+fn emg_pdf_std(z: f64, k: f64) -> f64 {
+    const SQRT2: f64 = std::f64::consts::SQRT_2;
+    // lambda*sigma = 1/k, and the prefactor lambda/2 is a constant in z — dropped, since only the
+    // ARGMAX is wanted.
+    let _ = SQRT2;
+    emg_tail_term(z, k)
+}
+
+impl Emg {
+    /// Build the shape for tailing factor `k`, truncated at `n_sigma` on the Gaussian side.
+    ///
+    /// Both derived constants are computed here, once, because both are far too expensive for the
+    /// render's inner loop.
+    pub fn new(k: f64, n_sigma: f64) -> Emg {
+        let k = k.max(1e-12); // k = 0 is the Gaussian limit; keep 1/k finite.
+
+        // The mode, by golden-section search on the (unimodal) standardised PDF. The mode of an EMG
+        // lies between mu and the mean mu + 1/lambda (z = k), so [-1, k+1] brackets it with room.
+        let (mut lo, mut hi) = (-1.0f64, k + 1.0);
+        const INV_PHI: f64 = 0.618_033_988_749_894_9;
+        let (mut c, mut d) = (hi - (hi - lo) * INV_PHI, lo + (hi - lo) * INV_PHI);
+        let (mut fc, mut fd) = (emg_pdf_std(c, k), emg_pdf_std(d, k));
+        for _ in 0..200 {
+            if fc > fd {
+                hi = d;
+                d = c;
+                fd = fc;
+                c = hi - (hi - lo) * INV_PHI;
+                fc = emg_pdf_std(c, k);
+            } else {
+                lo = c;
+                c = d;
+                fc = fd;
+                d = lo + (hi - lo) * INV_PHI;
+                fd = emg_pdf_std(d, k);
+            }
+        }
+        let mode_offset = 0.5 * (lo + hi);
+
+        // Right-tail reach. The Gaussian truncation at n_sigma leaves p = 0.5*erfc(n_sigma/sqrt2) of
+        // the mass outside; the exponential tail (time constant k, in units of sigma) falls to that
+        // same fraction after k*ln(1/p). Matching the two keeps `--n-sigma` meaning what it meant.
+        let p = 0.5 * erfc_nr(n_sigma / std::f64::consts::SQRT_2);
+        let tail_reach = if p > 0.0 && p < 1.0 { k * (1.0 / p).ln() } else { 0.0 };
+
+        Emg { k, mode_offset, tail_reach, peak_pdf: emg_pdf_std(mode_offset, k) }
+    }
+
+    /// Where this shape's peak sits relative to `mu`, in units of sigma — v1's `mode - mu`.
+    /// Exposed so the v1-parity test can check it against v1's own `erfcxinv` inversion.
+    pub fn mode_offset(&self) -> f64 {
+        self.mode_offset
+    }
+
+    /// Mass between `a` and `b`, for a peak whose **mode** (not `mu`) sits at `apex`.
+    #[inline]
+    fn frac(&self, a: f64, b: f64, apex: f64, sigma: f64) -> f64 {
+        // v1 anchors on the mode and solves for mu; here mu = apex - sigma*mode_offset, so the
+        // standardised coordinate is z = (x - mu)/sigma = (x - apex)/sigma + mode_offset.
+        let z = |x: f64| (x - apex) / sigma + self.mode_offset;
+        emg_cdf_std(z(b), self.k) - emg_cdf_std(z(a), self.k)
+    }
+}
+
+/// Mass of the elution peak between `a` and `b` for a peak apexing at `apex`. Dispatches on shape;
+/// the [`PeakShape::Gaussian`] arm is character-for-character the original [`gauss_frac`] call, so
+/// `--peak-shape gaussian` output is bit-identical to the pre-EMG binary.
+#[inline]
+pub fn elution_frac(a: f64, b: f64, apex: f64, sigma: f64, shape: &PeakShape) -> f64 {
+    match shape {
+        PeakShape::Gaussian => gauss_frac(a, b, apex, sigma),
+        PeakShape::Emg(e) => e.frac(a, b, apex, sigma),
+    }
+}
+
+/// Peak **ordinate** (height), normalised to 1.0 at the apex.
+///
+/// The Bruker writer integrates the peak over each frame ([`elution_frac`]); the Thermo and SCIEX
+/// writers instead sample the curve's height at the scan's timestamp. Same shape, different
+/// convention — so the shape switch has to exist in both forms or `--peak-shape emg` would silently
+/// mean nothing on two of the three writers. `t`, `apex` and `sigma` are in whatever unit the caller
+/// uses (seconds for Thermo/SCIEX); the EMG's `k` is dimensionless, so it needs no conversion.
+#[inline]
+pub fn elution_ordinate(t: f64, apex: f64, sigma: f64, shape: &PeakShape) -> f64 {
+    match shape {
+        // Bit-for-bit the expression the Thermo/SCIEX writers used before the switch existed.
+        PeakShape::Gaussian => (-((t - apex).powi(2)) / (2.0 * sigma * sigma)).exp(),
+        PeakShape::Emg(e) => emg_pdf_std((t - apex) / sigma + e.mode_offset, e.k) / e.peak_pdf,
+    }
+}
+
+/// Truncation half-widths `(left, right)` around the apex, in frames. Symmetric for a Gaussian;
+/// right-extended for an EMG, whose tail would otherwise be clipped by the symmetric window.
+#[inline]
+pub fn elution_half_widths(sigma: f64, n_sigma: f64, shape: &PeakShape) -> (f64, f64) {
+    match shape {
+        PeakShape::Gaussian => {
+            let h = n_sigma * sigma;
+            (h, h)
+        }
+        PeakShape::Emg(e) => (
+            (n_sigma + e.mode_offset) * sigma,
+            (n_sigma + e.tail_reach - e.mode_offset) * sigma,
+        ),
+    }
 }
 
 /// One ion to render: an elution apex (in frames), a mobility apex (in scans), a total abundance,
@@ -85,9 +338,9 @@ pub fn gauss_frac(a: f64, b: f64, mean: f64, sigma: f64) -> f64 {
 /// precursor↔fragment ratio (MS1 and MS2 share these weights), but if sub-bin peaks are ever needed,
 /// select bins whose *intervals* overlap the support and renormalise. Same caveat in [`scan_window`].
 fn active_window(apex_frame: f64, g: &Geometry) -> (u32, u32) {
-    let half = g.n_sigma * g.sigma_frames;
-    let start = (apex_frame - half).max(0.0) as u32;
-    let end = ((apex_frame + half) as u32).min(g.n_frames - 1);
+    let (left, right) = elution_half_widths(g.sigma_frames, g.n_sigma, &g.shape);
+    let start = (apex_frame - left).max(0.0) as u32;
+    let end = ((apex_frame + right) as u32).min(g.n_frames - 1);
     (start, end)
 }
 
@@ -162,7 +415,7 @@ pub fn stream_render_range<F: FnMut(FrameEmission)>(
         let f = frame as f64;
         for &Reverse((_, idx)) in active.iter() {
             let io = &ions[idx];
-            let ew = gauss_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames);
+            let ew = elution_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames, &g.shape);
             if ew <= 0.0 {
                 continue;
             }
@@ -245,7 +498,7 @@ pub fn stream_render_flat_range<F: FnMut(FlatEmission)>(
         let f = frame as f64;
         for &Reverse((_, idx)) in active.iter() {
             let io = &ions[idx];
-            let ew = gauss_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames);
+            let ew = elution_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames, &g.shape);
             if ew <= 0.0 {
                 continue;
             }
@@ -292,7 +545,7 @@ pub fn sweep_render(ions: &[Ion], g: &Geometry) -> BTreeMap<(u32, u32, u32), f64
 /// sweep — never on a real run.
 pub fn reference_render(ions: &[Ion], g: &Geometry) -> BTreeMap<(u32, u32, u32), f64> {
     let mut out: BTreeMap<(u32, u32, u32), f64> = BTreeMap::new();
-    let fhalf = g.n_sigma * g.sigma_frames;
+    let (fleft, fright) = elution_half_widths(g.sigma_frames, g.n_sigma, &g.shape);
     let shalf = g.n_sigma * g.sigma_scans;
     let last_frame = (g.n_frames - 1) as f64;
     let last_scan = (g.n_scans - 1) as f64;
@@ -301,13 +554,13 @@ pub fn reference_render(ions: &[Ion], g: &Geometry) -> BTreeMap<(u32, u32, u32),
         // Independent window derivation: clamp on the reals, then floor — a different code path from
         // active_window's truncate-then-clamp. For non-negative values the two agree, so any
         // divergence signals a real off-by-one in one of them, which is exactly what we want to see.
-        let fs = (io.apex_frame - fhalf).max(0.0).floor() as u32;
-        let fe = (io.apex_frame + fhalf).min(last_frame).floor() as u32;
+        let fs = (io.apex_frame - fleft).max(0.0).floor() as u32;
+        let fe = (io.apex_frame + fright).min(last_frame).floor() as u32;
         let ss = (io.scan_center - shalf).max(0.0).floor() as u32;
         let se = (io.scan_center + shalf).min(last_scan).floor() as u32;
 
         for frame in fs..=fe {
-            let ew = gauss_frac(frame as f64 - 0.5, frame as f64 + 0.5, io.apex_frame, g.sigma_frames);
+            let ew = elution_frac(frame as f64 - 0.5, frame as f64 + 0.5, io.apex_frame, g.sigma_frames, &g.shape);
             if ew <= 0.0 {
                 continue;
             }
@@ -392,7 +645,7 @@ mod tests {
     use super::*;
 
     fn geom() -> Geometry {
-        Geometry { n_frames: 40, n_scans: 30, sigma_frames: 2.5, sigma_scans: 1.5, n_sigma: 3.0 }
+        Geometry { n_frames: 40, n_scans: 30, sigma_frames: 2.5, sigma_scans: 1.5, n_sigma: 3.0, shape: PeakShape::Gaussian }
     }
 
     /// A fixture that deliberately exercises the bug-prone cases Codex called out:
@@ -584,5 +837,135 @@ mod tests {
         // effectively the whole distribution
         let whole = gauss_frac(-20.0, 20.0, 0.0, 1.0);
         assert!((whole - 1.0).abs() < 1e-6, "full mass {whole}");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // EMG peak shape
+    // -----------------------------------------------------------------------------------------
+
+    /// `--peak-shape gaussian` must be the OLD code path, not merely an equal one: the guarantee we
+    /// sell is bit-for-bit reproduction of every render made before the EMG existed.
+    #[test]
+    fn gaussian_shape_is_bit_identical_to_gauss_frac() {
+        let s = PeakShape::Gaussian;
+        for &sigma in &[0.5, 2.5, 30.0] {
+            for i in -60..60 {
+                let f = i as f64 * 0.37;
+                let a = elution_frac(f - 0.5, f + 0.5, 4.25, sigma, &s);
+                let b = gauss_frac(f - 0.5, f + 0.5, 4.25, sigma);
+                assert_eq!(a.to_bits(), b.to_bits(), "sigma={sigma} f={f}: {a} vs {b}");
+            }
+        }
+        // ...and the truncation window must be the untouched symmetric one.
+        assert_eq!(elution_half_widths(30.0, 3.0, &s), (90.0, 90.0));
+    }
+
+    /// The EMG must actually be a distribution: monotone, spanning [0,1], integrating to 1.
+    #[test]
+    fn emg_cdf_is_a_proper_cdf() {
+        for &k in &[0.05, V1_DEFAULT_EMG_K, 2.0, 9.5] {
+            assert!(emg_cdf_std(-40.0, k) < 1e-9, "k={k} left limit");
+            assert!((emg_cdf_std(60.0 + 400.0 * k, k) - 1.0).abs() < 1e-6, "k={k} right limit");
+            let mut prev = 0.0;
+            for i in 0..2000 {
+                let z = -10.0 + i as f64 * 0.02;
+                let c = emg_cdf_std(z, k);
+                assert!(c >= prev - 1e-12, "k={k} not monotone at z={z}");
+                assert!((-1e-9..=1.0 + 1e-9).contains(&c), "k={k} out of [0,1] at z={z}: {c}");
+                prev = c;
+            }
+        }
+    }
+
+    /// `k -> 0` is the Gaussian limit. This is what makes `k` a *shape* knob orthogonal to `sigma`.
+    #[test]
+    fn emg_degenerates_to_a_gaussian_as_k_goes_to_zero() {
+        // The convergence is first order: F_emg(z) = Phi(z) - k*phi(z) + O(k^2), so the deviation
+        // must fall PROPORTIONALLY with k. Asserting that (rather than one fixed epsilon) is what
+        // actually pins the limit.
+        for &k in &[1e-3, 1e-5, 1e-7] {
+            for i in -30..30 {
+                let z = i as f64 * 0.25;
+                let emg = emg_cdf_std(z, k);
+                let gauss = 0.5 * erfc_nr(-z / std::f64::consts::SQRT_2);
+                // |phi| <= 0.3990, plus room for the erfc approximation's own ~1e-9 noise.
+                let tol = 0.4 * k + 1e-8;
+                assert!((emg - gauss).abs() < tol, "k={k} z={z}: emg {emg} vs gauss {gauss}");
+            }
+        }
+    }
+
+    /// The whole point: an EMG peak is TAILED. Mass to the right of the apex must exceed mass to the
+    /// left, the excess must grow with `k`, and a Gaussian must show none of it.
+    #[test]
+    fn emg_peaks_are_right_tailed_and_gaussians_are_not() {
+        let sigma = 30.0;
+        let apex = 500.0;
+        let mass = |shape: &PeakShape, lo: f64, hi: f64| elution_frac(lo, hi, apex, sigma, shape);
+
+        let g = PeakShape::Gaussian;
+        let (gl, gr) = (mass(&g, apex - 400.0, apex), mass(&g, apex, apex + 400.0));
+        // 1e-7 not 1e-9: the A&S erf backing `gauss_frac` is itself only good to ~1.5e-7.
+        assert!((gl - gr).abs() < 1e-7, "Gaussian must be symmetric: {gl} vs {gr}");
+
+        let mut last_ratio = 1.0;
+        for &k in &[0.25, V1_DEFAULT_EMG_K, 1.5] {
+            let e = PeakShape::Emg(Emg::new(k, 3.0));
+            let (l, r) = (mass(&e, apex - 400.0, apex), mass(&e, apex, apex + 400.0));
+            assert!(r > l, "k={k}: EMG must carry more mass right of the apex ({r} vs {l})");
+            let ratio = r / l;
+            assert!(ratio > last_ratio, "k={k}: tailing must increase with k ({ratio} <= {last_ratio})");
+            last_ratio = ratio;
+        }
+    }
+
+    /// The apex must be where the peak actually PEAKS. v1 anchors on the mode and solves back for
+    /// `mu`; if the render skipped that inversion every peptide would elute systematically late.
+    #[test]
+    fn emg_apex_frame_is_the_mode() {
+        let sigma = 30.0;
+        let apex = 500.0;
+        for &k in &[0.1, V1_DEFAULT_EMG_K, 3.0] {
+            let e = PeakShape::Emg(Emg::new(k, 3.0));
+            let at_apex = elution_frac(apex - 0.5, apex + 0.5, apex, sigma, &e);
+            for d in [-90.0, -30.0, -5.0, -1.0, 1.0, 5.0, 30.0, 90.0] {
+                let off = elution_frac(apex + d - 0.5, apex + d + 0.5, apex, sigma, &e);
+                assert!(off <= at_apex, "k={k}: bin at +{d} ({off}) beats the apex bin ({at_apex})");
+            }
+        }
+    }
+
+    /// The truncation window must actually hold the peak. A symmetric window would clip the tail.
+    #[test]
+    fn emg_window_is_asymmetric_and_captures_the_mass() {
+        let (sigma, n_sigma) = (30.0, 3.0);
+        let e = PeakShape::Emg(Emg::new(V1_DEFAULT_EMG_K, n_sigma));
+        let (left, right) = elution_half_widths(sigma, n_sigma, &e);
+        assert!(right > left, "EMG window must reach further right: {left} / {right}");
+        let apex = 10_000.0;
+        let captured = elution_frac(apex - left, apex + right, apex, sigma, &e);
+        // The Gaussian at 3 sigma keeps 99.73%; the EMG window is built to hold at least as much.
+        assert!(captured > 0.997, "window keeps only {captured}");
+    }
+
+    /// The ordinate form (Thermo/SCIEX) must agree with the Gaussian bit-for-bit and must peak at 1.
+    #[test]
+    fn elution_ordinate_matches_both_conventions() {
+        let (sigma, apex) = (3.0, 120.0);
+        let two_sig2 = 2.0 * sigma * sigma;
+        for i in -50..50 {
+            let t = apex + i as f64 * 0.3;
+            let got = elution_ordinate(t, apex, sigma, &PeakShape::Gaussian);
+            let want = (-((t - apex).powi(2)) / two_sig2).exp();
+            assert_eq!(got.to_bits(), want.to_bits(), "t={t}");
+        }
+        for &k in &[0.2, V1_DEFAULT_EMG_K, 2.0] {
+            let e = PeakShape::Emg(Emg::new(k, 3.0));
+            let top = elution_ordinate(apex, apex, sigma, &e);
+            assert!((top - 1.0).abs() < 1e-9, "k={k}: apex height {top} != 1");
+            for d in [-20.0, -3.0, 3.0, 20.0] {
+                assert!(elution_ordinate(apex + d, apex, sigma, &e) <= top, "k={k} d={d}");
+            }
+        }
     }
 }

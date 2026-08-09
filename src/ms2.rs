@@ -14,7 +14,7 @@
 //! emission loop, the diagonal lookup, AND the transmission maths are all corroborated independently.
 
 use crate::dia::DiaSchedule;
-use crate::render::{gauss_frac, Geometry};
+use crate::render::{elution_frac, gauss_frac, Geometry};
 use mscore::timstof::quadrupole::IonTransmission;
 use std::collections::{BTreeMap, HashMap};
 
@@ -46,9 +46,9 @@ pub struct DiaIon {
 /// chunked streaming render can decide which ions are active in a given frame range without duplicating
 /// the window maths.
 pub fn active_frames(apex: f64, g: &Geometry) -> (u32, u32) {
-    let half = g.n_sigma * g.sigma_frames;
-    let start = (apex - half).max(1.0) as u32;
-    let end = ((apex + half) as u32).min(g.n_frames);
+    let (left, right) = crate::render::elution_half_widths(g.sigma_frames, g.n_sigma, &g.shape);
+    let start = (apex - left).max(1.0) as u32;
+    let end = ((apex + right) as u32).min(g.n_frames);
     (start, end)
 }
 
@@ -72,7 +72,7 @@ pub fn ms2_render(ions: &[DiaIon], sched: &DiaSchedule, g: &Geometry) -> BTreeMa
             if frame < fs || frame > fe {
                 continue;
             }
-            let ew = gauss_frac(f - 0.5, f + 0.5, ion.apex_frame, g.sigma_frames);
+            let ew = elution_frac(f - 0.5, f + 0.5, ion.apex_frame, g.sigma_frames, &g.shape);
             if ew <= 0.0 {
                 continue;
             }
@@ -138,7 +138,7 @@ pub fn ms2_reference(ions: &[DiaIon], sched: &DiaSchedule, g: &Geometry) -> BTre
                 continue; // MS1 frame — no fragments
             };
             let f = frame as f64;
-            let ew = gauss_frac(f - 0.5, f + 0.5, ion.apex_frame, g.sigma_frames);
+            let ew = elution_frac(f - 0.5, f + 0.5, ion.apex_frame, g.sigma_frames, &g.shape);
             if ew <= 0.0 {
                 continue;
             }
@@ -246,7 +246,7 @@ pub fn dia_render_range<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
         buf.clear();
         for &idx in &active {
             let ion = &ions[idx];
-            let ew = gauss_frac(f - 0.5, f + 0.5, ion.apex_frame, g.sigma_frames);
+            let ew = elution_frac(f - 0.5, f + 0.5, ion.apex_frame, g.sigma_frames, &g.shape);
             if ew <= 0.0 {
                 continue;
             }
@@ -317,7 +317,7 @@ mod tests {
     use ms_io::data::meta::{DiaMsMisInfo, DiaMsMsWindow};
 
     fn geom() -> Geometry {
-        Geometry { n_frames: 9, n_scans: 3, sigma_frames: 2.0, sigma_scans: 1.0, n_sigma: 2.0 }
+        Geometry { n_frames: 9, n_scans: 3, sigma_frames: 2.0, sigma_scans: 1.0, n_sigma: 2.0, shape: crate::render::PeakShape::Gaussian }
     }
 
     /// 3-frame cycle [MS1, g1(iso 500±5), g2(iso 600±5)], windows over scans 0..=2.

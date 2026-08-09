@@ -56,6 +56,16 @@ struct Args {
     /// Chromatographic peak width (Gaussian sigma) in seconds.
     #[arg(long, default_value_t = 3.0)] sigma_seconds: f64,
     #[arg(long, default_value_t = 3.0)] n_sigma: f64,
+    /// Chromatographic peak shape for the ELUTION axis. `emg` (the DEFAULT) is v1's exponentially
+    /// modified Gaussian — a Gaussian of width `--sigma-seconds` convolved with a one-sided
+    /// exponential tail of time constant `--emg-k * sigma`. `gaussian` restores the pre-EMG
+    /// behaviour BIT-FOR-BIT.
+    ///
+    /// !!! This default is INVISIBLE to necroflow's command-string fingerprint. See PEAK_SHAPE.md.
+    #[arg(long, value_enum, default_value_t = PeakShapeArg::Emg)] peak_shape: PeakShapeArg,
+    /// EMG tailing factor `k = 1/(sigma*lambda)`, i.e. the tail time constant in units of sigma.
+    /// Default = v1's mean draw, `E[k] = 10/21`. Ignored unless `--peak-shape emg`.
+    #[arg(long, default_value_t = timsim_cli::render::V1_DEFAULT_EMG_K)] emg_k: f64,
     /// Quadrupole edge steepness `k` for the isolation-window transmission.
     #[arg(long, default_value_t = 15.0)] transmission_k: f64,
     /// Fraction of the RT span trimmed at each end (avoid loading/wash regions).
@@ -152,6 +162,21 @@ fn build_windows(a: &Args) -> Result<Vec<(f64, f64)>> {
         }
         let n = ((a.mz_max - a.mz_min) / a.window_width).ceil() as usize;
         Ok((0..n).map(|k| (a.mz_min + a.window_width * (k as f64 + 0.5), a.window_width)).collect())
+    }
+}
+
+
+/// CLI spelling of [`timsim_cli::render::PeakShape`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PeakShapeArg { Gaussian, Emg }
+
+impl PeakShapeArg {
+    fn resolve(self, emg_k: f64, n_sigma: f64) -> timsim_cli::render::PeakShape {
+        match self {
+            PeakShapeArg::Gaussian => timsim_cli::render::PeakShape::Gaussian,
+            PeakShapeArg::Emg => timsim_cli::render::PeakShape::Emg(
+                timsim_cli::render::Emg::new(emg_k, n_sigma)),
+        }
     }
 }
 
@@ -253,10 +278,10 @@ fn main() -> Result<()> {
     eprintln!("precursors: {} eligible ({} outside window coverage)", precs.len(), outside);
 
     // Active-set sweep over scans (schedule RT monotonic). A precursor is active in [apex ± nσ·σ].
-    let half = a.n_sigma * a.sigma_seconds;
+    let shape = a.peak_shape.resolve(a.emg_k, a.n_sigma);
+    let (hleft, hright) = timsim_cli::render::elution_half_widths(a.sigma_seconds, a.n_sigma, &shape);
     let mut order: Vec<usize> = (0..precs.len()).collect();
     order.sort_by(|&x, &y| precs[x].apex_rt.total_cmp(&precs[y].apex_rt));
-    let two_sig2 = 2.0 * a.sigma_seconds * a.sigma_seconds;
     let floor = a.min_peak_intensity as f32;
 
     let (mut cursor, mut ms1_n, mut ms2_n) = (0usize, 0u64, 0u64);
@@ -264,15 +289,15 @@ fn main() -> Result<()> {
     let mut with_ms2: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut scans: Vec<MzMlScan> = Vec::with_capacity(sched.len());
     for &(_scan, t, ms_level, center, width, ce) in &sched {
-        while cursor < order.len() && precs[order[cursor]].apex_rt - half <= t { active.push(order[cursor]); cursor += 1; }
-        active.retain(|&i| precs[i].apex_rt + half >= t);
+        while cursor < order.len() && precs[order[cursor]].apex_rt - hleft <= t { active.push(order[cursor]); cursor += 1; }
+        active.retain(|&i| precs[i].apex_rt + hright >= t);
 
         let mut peaks: Vec<(f64, f32)> = Vec::new();
         let mut isolation = None;
         if ms_level == 1 {
             for &i in &active {
                 let p = &precs[i];
-                let w = (-((t - p.apex_rt).powi(2)) / two_sig2).exp();
+                let w = timsim_cli::render::elution_ordinate(t, p.apex_rt, a.sigma_seconds, &shape);
                 if w <= 1e-6 { continue; }
                 let base = p.abundance * w * a.intensity_scale;
                 for &(m, iv) in &p.ms1 {
@@ -286,7 +311,7 @@ fn main() -> Result<()> {
                 let p = &precs[i];
                 let tprob = wt.probabilities(&[p.mz])[0];
                 if tprob <= 1e-3 { continue; }
-                let ew = (-((t - p.apex_rt).powi(2)) / two_sig2).exp();
+                let ew = timsim_cli::render::elution_ordinate(t, p.apex_rt, a.sigma_seconds, &shape);
                 if ew <= 1e-6 { continue; }
                 let base = p.abundance * ew * tprob * a.intensity_scale;
                 for &(m, iv) in &p.ms2 {

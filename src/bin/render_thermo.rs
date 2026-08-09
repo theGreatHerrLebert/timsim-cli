@@ -43,6 +43,16 @@ struct Args {
     /// Chromatographic peak width (Gaussian sigma) in SECONDS of the template gradient.
     #[arg(long, default_value_t = 3.0)] sigma_seconds: f64,
     #[arg(long, default_value_t = 3.0)] n_sigma: f64,
+    /// Chromatographic peak shape for the ELUTION axis. `emg` (the DEFAULT) is v1's exponentially
+    /// modified Gaussian — a Gaussian of width `--sigma-seconds` convolved with a one-sided
+    /// exponential tail of time constant `--emg-k * sigma`. `gaussian` restores the pre-EMG
+    /// behaviour BIT-FOR-BIT.
+    ///
+    /// !!! This default is INVISIBLE to necroflow's command-string fingerprint. See PEAK_SHAPE.md.
+    #[arg(long, value_enum, default_value_t = PeakShapeArg::Emg)] peak_shape: PeakShapeArg,
+    /// EMG tailing factor `k = 1/(sigma*lambda)`, i.e. the tail time constant in units of sigma.
+    /// Default = v1's mean draw, `E[k] = 10/21`. Ignored unless `--peak-shape emg`.
+    #[arg(long, default_value_t = timsim_cli::render::V1_DEFAULT_EMG_K)] emg_k: f64,
     /// Quadrupole edge steepness `k` (sigmoid) for the isolation-window transmission — same as the
     /// timsTOF TimsTransmissionDIA default.
     #[arg(long, default_value_t = 15.0)] transmission_k: f64,
@@ -118,6 +128,21 @@ struct Prec {
     apex_rt: f64,
     ms1: Vec<(f64, f32)>,
     ms2: Vec<(f64, f32)>,
+}
+
+
+/// CLI spelling of [`timsim_cli::render::PeakShape`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PeakShapeArg { Gaussian, Emg }
+
+impl PeakShapeArg {
+    fn resolve(self, emg_k: f64, n_sigma: f64) -> timsim_cli::render::PeakShape {
+        match self {
+            PeakShapeArg::Gaussian => timsim_cli::render::PeakShape::Gaussian,
+            PeakShapeArg::Emg => timsim_cli::render::PeakShape::Emg(
+                timsim_cli::render::Emg::new(emg_k, n_sigma)),
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -301,10 +326,10 @@ fn main() -> Result<()> {
     }
 
     // Active-set sweep over slots (schedule RT is monotonic). A precursor is active in [apex ± nσ·σ].
-    let half = a.n_sigma * a.sigma_seconds;
+    let shape = a.peak_shape.resolve(a.emg_k, a.n_sigma);
+    let (hleft, hright) = timsim_cli::render::elution_half_widths(a.sigma_seconds, a.n_sigma, &shape);
     let mut order: Vec<usize> = (0..precs.len()).collect();
     order.sort_by(|&x, &y| precs[x].apex_rt.total_cmp(&precs[y].apex_rt)); // total_cmp: NaN-safe (guarded finite above)
-    let two_sig2 = 2.0 * a.sigma_seconds * a.sigma_seconds;
     let floor = a.min_peak_intensity as f32;
 
     // The .raw peak count is a u32 on disk, but the thermorawfile author_centroids/author_profile
@@ -319,14 +344,14 @@ fn main() -> Result<()> {
     let mut active: Vec<usize> = Vec::new();
     for (slot, (&(_scan, ms_level, _is_profile), &(t, iso))) in manifest.iter().zip(schedule.iter()).enumerate() {
         // Advance/retract the active set to slot time t.
-        while cursor < order.len() && precs[order[cursor]].apex_rt - half <= t { active.push(order[cursor]); cursor += 1; }
-        active.retain(|&i| precs[i].apex_rt + half >= t);
+        while cursor < order.len() && precs[order[cursor]].apex_rt - hleft <= t { active.push(order[cursor]); cursor += 1; }
+        active.retain(|&i| precs[i].apex_rt + hright >= t);
 
         let mut peaks: Vec<(f64, f32)> = Vec::new();
         if ms_level == 1 {
             for &i in &active {
                 let p = &precs[i];
-                let w = (-((t - p.apex_rt).powi(2)) / two_sig2).exp();
+                let w = timsim_cli::render::elution_ordinate(t, p.apex_rt, a.sigma_seconds, &shape);
                 if w <= 1e-6 { continue; }
                 let base = p.abundance * w * a.intensity_scale;
                 for &(m, iv) in &p.ms1 {
@@ -344,7 +369,7 @@ fn main() -> Result<()> {
                 let p = &precs[i];
                 let tprob = wt.probabilities(&[p.mz])[0];
                 if tprob <= 1e-3 { continue; }
-                let ew = (-((t - p.apex_rt).powi(2)) / two_sig2).exp();
+                let ew = timsim_cli::render::elution_ordinate(t, p.apex_rt, a.sigma_seconds, &shape);
                 if ew <= 1e-6 { continue; }
                 let base = p.abundance * ew * tprob * a.intensity_scale;
                 for &(m, iv) in &p.ms2 {

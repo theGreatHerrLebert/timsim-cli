@@ -26,6 +26,9 @@ pub struct Candidate {
     pub abundance: f64,
     pub sigma_frames: f64,
     pub n_sigma: f64,
+    /// The chromatographic peak shape. MUST be the same value the deposition render uses, or the
+    /// scheme ranks precursors by an intensity the writer never deposits.
+    pub shape: crate::render::PeakShape,
 }
 
 pub struct SelectionParams {
@@ -87,24 +90,16 @@ pub struct DdaSchedule {
     pub events: Vec<SelectionEvent>,
 }
 
-/// Gaussian mass in the unit frame around `frame` (CDF difference), for the per-frame MS1 elution weight.
-fn elution_weight(frame: u32, apex: f64, sigma: f64) -> f64 {
-    let z = |x: f64| 0.5 * (1.0 + erf((x - apex) / (sigma * std::f64::consts::SQRT_2)));
-    (z(frame as f64 + 0.5) - z(frame as f64 - 0.5)).max(0.0)
-}
-
-/// Abramowitz-Stegun erf (max err ~1.5e-7) — self-contained so the scheme has no heavy dep.
-fn erf(x: f64) -> f64 {
-    let t = 1.0 / (1.0 + 0.3275911 * x.abs());
-    let y = 1.0
-        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592)
-            * t
-            * (-x * x).exp();
-    if x >= 0.0 {
-        y
-    } else {
-        -y
-    }
+/// Peak mass in the unit frame around `frame` (CDF difference), for the per-frame MS1 elution weight.
+///
+/// This used to be a private copy of the render's Gaussian, complete with its own `erf`. That was a
+/// trap: the DDA *scheduler* ranks precursors by this weight while the *writer* deposits with
+/// `render::elution_frac`, so any divergence makes the scheme select on an intensity that is never
+/// emitted. It now calls the one shared kernel. (The delegation is bit-exact for the Gaussian arm:
+/// the old body was `0.5*(1+erf(..))` differenced over the same bounds with the same A&S `erf`,
+/// which is precisely what `gauss_frac` computes; only the `.max(0.0)` clamp is kept here.)
+fn elution_weight(frame: u32, apex: f64, sigma: f64, shape: &crate::render::PeakShape) -> f64 {
+    crate::render::elution_frac(frame as f64 - 0.5, frame as f64 + 0.5, apex, sigma, shape).max(0.0)
 }
 
 /// Run the full schedule over `n_frames`.
@@ -116,11 +111,14 @@ pub fn schedule(cands: &[Candidate], params: &SelectionParams, n_frames: u32) ->
     let last_ms1 = *ms1_frames.last().unwrap_or(&0);
 
     // Active frame window per candidate (for finding a cycle's candidates cheaply via a sweep).
-    let half: Vec<f64> = cands.iter().map(|c| c.n_sigma * c.sigma_frames).collect();
+    let half: Vec<(f64, f64)> = cands
+        .iter()
+        .map(|c| crate::render::elution_half_widths(c.sigma_frames, c.n_sigma, &c.shape))
+        .collect();
     let win: Vec<(u32, u32)> = cands
         .iter()
         .zip(&half)
-        .map(|(c, &h)| ((c.apex_frame - h).max(1.0) as u32, ((c.apex_frame + h) as u32).min(n_frames)))
+        .map(|(c, &(l, r))| ((c.apex_frame - l).max(1.0) as u32, ((c.apex_frame + r) as u32).min(n_frames)))
         .collect();
     let mut order_by_start: Vec<usize> = (0..cands.len()).collect();
     order_by_start.sort_unstable_by_key(|&i| win[i].0);
@@ -151,7 +149,7 @@ pub fn schedule(cands: &[Candidate], params: &SelectionParams, n_frames: u32) ->
             .iter()
             .filter_map(|&i| {
                 let c = &cands[i];
-                let inten = c.abundance * elution_weight(f, c.apex_frame, c.sigma_frames);
+                let inten = c.abundance * elution_weight(f, c.apex_frame, c.sigma_frames, &c.shape);
                 (inten >= params.intensity_threshold && inten > 0.0).then_some((inten, i))
             })
             .collect();
@@ -227,7 +225,8 @@ mod tests {
         Candidate {
             precursor_id: id, order, apex_frame: apex, scan_apex: scan,
             mono_mz: 500.0, largest_mz: 500.5, average_mz: 500.25, charge: 2, abundance: 1000.0,
-            sigma_frames: 5.0, n_sigma: 3.0,
+            sigma_frames: 5.0,
+            shape: crate::render::PeakShape::Gaussian, n_sigma: 3.0,
         }
     }
 

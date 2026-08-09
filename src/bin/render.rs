@@ -85,6 +85,25 @@ struct Args {
     sigma_scans: f64,
     #[arg(long, default_value_t = 3.0)]
     n_sigma: f64,
+    /// Chromatographic peak shape for the ELUTION axis.
+    ///
+    /// `emg` (the DEFAULT) is v1's exponentially modified Gaussian: a Gaussian of width `sigma`
+    /// convolved with a one-sided exponential tail of time constant `--emg-k * sigma`. Real LC peaks
+    /// tail; the symmetric `gaussian` v2 shipped with does not, which is why the default moved.
+    ///
+    /// `gaussian` restores the pre-EMG behaviour BIT-FOR-BIT.
+    ///
+    /// !!! This default is INVISIBLE to necroflow's command-string fingerprint: a render cached
+    /// before this flag existed was made with `gaussian` and will NOT be rebuilt. See PEAK_SHAPE.md.
+    #[arg(long, value_enum, default_value_t = PeakShapeArg::Emg)]
+    peak_shape: PeakShapeArg,
+    /// EMG tailing factor `k = 1 / (sigma * lambda)` — the tail time constant in units of sigma.
+    /// `0` is the Gaussian limit; larger is more tailed. Ignored unless `--peak-shape emg`.
+    ///
+    /// The default is v1's mean draw, `E[k] = 10/21 = 0.47619` (v1 samples
+    /// `k ~ 0 + Beta(1,20)*10`; see `imspy_simulation/timsim/simulator.py`).
+    #[arg(long, default_value_t = timsim_cli::render::V1_DEFAULT_EMG_K)]
+    emg_k: f64,
     /// Simple-mode m/z and 1/K0 ranges + digitizer size (ignored in --reference-d mode).
     #[arg(long, default_value_t = 100.0)]
     mz_min: f64,
@@ -341,6 +360,27 @@ fn build_placement(a: &Args) -> Result<Placement> {
     }
 }
 
+
+/// CLI spelling of [`timsim_cli::render::PeakShape`] (the real one carries derived constants).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PeakShapeArg {
+    /// Symmetric Gaussian — v2's historical shape. Bit-identical to the pre-EMG binary.
+    Gaussian,
+    /// v1's exponentially modified Gaussian (tailed).
+    Emg,
+}
+
+impl PeakShapeArg {
+    fn resolve(self, emg_k: f64, n_sigma: f64) -> timsim_cli::render::PeakShape {
+        match self {
+            PeakShapeArg::Gaussian => timsim_cli::render::PeakShape::Gaussian,
+            PeakShapeArg::Emg => {
+                timsim_cli::render::PeakShape::Emg(timsim_cli::render::Emg::new(emg_k, n_sigma))
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let mut a = Args::parse();
     if !(a.intensity_scale.is_finite() && a.intensity_scale > 0.0) {
@@ -410,6 +450,7 @@ fn main() -> Result<()> {
         sigma_frames: a.sigma_frames,
         sigma_scans: a.sigma_scans,
         n_sigma: a.n_sigma,
+        shape: a.peak_shape.resolve(a.emg_k, a.n_sigma),
     };
 
     // peptide_id -> rt_index.
@@ -1070,7 +1111,7 @@ fn scan_window_dda(scan: i64, g: &Geometry, n_scans: u32) -> (u32, u32) {
 fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f64, span: f64) -> Result<()> {
     use ms_io::data::tdf_writer::{DdaPasefWindow, DdaPrecursor, TdfWriter, TdfWriterConfig};
     use timsim_cli::dda::{schedule, Candidate, SelectionParams};
-    use timsim_cli::render::gauss_frac;
+    use timsim_cli::render::{elution_frac, gauss_frac};
 
     let ref_d = a.reference_d.as_ref().ok_or_else(|| anyhow!("--dda requires --reference-d"))?;
     let _ = ref_d;
@@ -1128,7 +1169,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 cands.push(Candidate {
                     precursor_id: pcid.value(i), order, apex_frame, scan_apex: scan,
                     mono_mz, largest_mz, average_mz, charge: chg.value(i).max(1) as i64, abundance,
-                    sigma_frames: g.sigma_frames, n_sigma: g.n_sigma,
+                    sigma_frames: g.sigma_frames, n_sigma: g.n_sigma, shape: g.shape,
                 });
             }
             ions.insert(pcid.value(i), DdaIon { peptide_id: pid.value(i), apex_frame, scan, abundance, ms1, ms2 });
@@ -1163,8 +1204,8 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
 
     // Active-set sweep over ions by apex frame, for the MS1 survey deposition.
     let win: Vec<(u32, u32, u64)> = ions.iter().map(|(&id, io)| {
-        let h = g.n_sigma * g.sigma_frames;
-        ((io.apex_frame - h).max(1.0) as u32, ((io.apex_frame + h) as u32).min(a.n_frames), id)
+        let (left, right) = timsim_cli::render::elution_half_widths(g.sigma_frames, g.n_sigma, &g.shape);
+        ((io.apex_frame - left).max(1.0) as u32, ((io.apex_frame + right) as u32).min(a.n_frames), id)
     }).collect();
     let mut order_start: Vec<usize> = (0..win.len()).collect();
     // Sort by (frame_start, precursor_id) — the precursor_id tiebreak makes the active-set insertion, and
@@ -1216,7 +1257,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 if is_ms1 {
                     for &i in &active {
                         let io = &ions[&win[i].2];
-                        let ew = gauss_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames);
+                        let ew = elution_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames, &g.shape);
                         if ew <= 0.0 { continue; }
                         let (slo, shi) = scan_window_dda(io.scan, g, n_scans);
                         for scan in slo..=shi {
@@ -1229,7 +1270,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 } else if let Some(evs) = events_by_frame.get(&(frame as i64)) {
                     for e in evs {
                         let io = &ions[&e.precursor_id];
-                        let ew = gauss_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames);
+                        let ew = elution_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames, &g.shape);
                         if ew <= 0.0 { continue; }
                         let s0 = e.scan_begin.max(0) as u32;
                         let s1 = (e.scan_end.min(n_scans as i64 - 1)).max(0) as u32;

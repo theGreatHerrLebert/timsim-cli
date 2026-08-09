@@ -48,6 +48,25 @@ struct Args {
     /// Truncate each peak's window at this many sigma (the target_p analog).
     #[arg(long, default_value_t = 3.0)]
     n_sigma: f64,
+    /// Chromatographic peak shape for the ELUTION axis.
+    ///
+    /// `emg` (the DEFAULT) is v1's exponentially modified Gaussian: a Gaussian of width `sigma`
+    /// convolved with a one-sided exponential tail of time constant `--emg-k * sigma`. Real LC peaks
+    /// tail; the symmetric `gaussian` v2 shipped with does not, which is why the default moved.
+    ///
+    /// `gaussian` restores the pre-EMG behaviour BIT-FOR-BIT.
+    ///
+    /// !!! This default is INVISIBLE to necroflow's command-string fingerprint: a render cached
+    /// before this flag existed was made with `gaussian` and will NOT be rebuilt. See PEAK_SHAPE.md.
+    #[arg(long, value_enum, default_value_t = PeakShapeArg::Emg)]
+    peak_shape: PeakShapeArg,
+    /// EMG tailing factor `k = 1 / (sigma * lambda)` — the tail time constant in units of sigma.
+    /// `0` is the Gaussian limit; larger is more tailed. Ignored unless `--peak-shape emg`.
+    ///
+    /// The default is v1's mean draw, `E[k] = 10/21 = 0.47619` (v1 samples
+    /// `k ~ 0 + Beta(1,20)*10`; see `imspy_simulation/timsim/simulator.py`).
+    #[arg(long, default_value_t = timsim_cli::render::V1_DEFAULT_EMG_K)]
+    emg_k: f64,
     /// Cap on precursors read (0 = all). For scaling curves.
     #[arg(long, default_value_t = 0)]
     limit: usize,
@@ -335,6 +354,27 @@ fn run_chunked(a: &Args, g: &Geometry, ions: &[Ion]) -> Result<()> {
     Ok(())
 }
 
+
+/// CLI spelling of [`timsim_cli::render::PeakShape`] (the real one carries derived constants).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PeakShapeArg {
+    /// Symmetric Gaussian — v2's historical shape. Bit-identical to the pre-EMG binary.
+    Gaussian,
+    /// v1's exponentially modified Gaussian (tailed).
+    Emg,
+}
+
+impl PeakShapeArg {
+    fn resolve(self, emg_k: f64, n_sigma: f64) -> timsim_cli::render::PeakShape {
+        match self {
+            PeakShapeArg::Gaussian => timsim_cli::render::PeakShape::Gaussian,
+            PeakShapeArg::Emg => {
+                timsim_cli::render::PeakShape::Emg(timsim_cli::render::Emg::new(emg_k, n_sigma))
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let a = Args::parse();
     let g = Geometry {
@@ -343,6 +383,7 @@ fn main() -> Result<()> {
         sigma_frames: a.sigma_frames,
         sigma_scans: a.sigma_scans,
         n_sigma: a.n_sigma,
+        shape: a.peak_shape.resolve(a.emg_k, a.n_sigma),
     };
     let t_load = std::time::Instant::now();
 
