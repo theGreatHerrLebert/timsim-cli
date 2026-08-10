@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "GAUSSIAN GOLDEN — every hash below was produced TWICE: once by the pre-EMG parent commit",
+    "GAUSSIAN GOLDEN \u2014 every hash below was produced TWICE: once by the pre-EMG parent commit",
     "52e6c91 (which had no --peak-shape flag at all, so it renders the Gaussian by construction),",
     "and once by this tree with `--peak-shape gaussian`. Both runs agreed. tests/golden_gaussian.rs",
     "re-runs the same four writer/mode combinations and re-checks them, so any future drift in the",
@@ -34,21 +34,40 @@
       "name": "bruker_dia",
       "bin": "timsim-render",
       "args": [
-        "--precursors", "{precursors}",
-        "--peptide-rt", "{peptide_rt}",
-        "--ion-spectra", "{ion_spectra}",
-        "--precursor-ccs", "{precursor_ccs}",
-        "--peptide-quantities", "{peptide_quantities}",
-        "--sample", "A_R1",
-        "--reference-d", "{reference_d}",
+        "--precursors",
+        "{precursors}",
+        "--peptide-rt",
+        "{peptide_rt}",
+        "--ion-spectra",
+        "{ion_spectra}",
+        "--precursor-ccs",
+        "{precursor_ccs}",
+        "--peptide-quantities",
+        "{peptide_quantities}",
+        "--sample",
+        "A_R1",
+        "--reference-d",
+        "{reference_d}",
         "--dia",
-        "--n-frames", "1200",
-        "--intensity-scale", "500000.0",
-        "--out", "{out}/data.d",
-        "--truth", "{out}/truth.parquet",
-        "--peak-shape", "gaussian"
+        "--n-frames",
+        "1200",
+        "--intensity-scale",
+        "500000.0",
+        "--out",
+        "{out}/data.d",
+        "--truth",
+        "{out}/truth.parquet",
+        "--peak-shape",
+        "gaussian"
       ],
-      "needs": ["precursors", "peptide_rt", "ion_spectra", "precursor_ccs", "peptide_quantities", "reference_d"],
+      "needs": [
+        "precursors",
+        "peptide_rt",
+        "ion_spectra",
+        "precursor_ccs",
+        "peptide_quantities",
+        "reference_d"
+      ],
       "artifacts": [
         {
           "path": "data.d/analysis.tdf_bin",
@@ -61,22 +80,26 @@
           "path": "data.d/analysis.tdf",
           "role": "signal+metadata",
           "hash": "file_sha256",
-          "sha256": "b0499710bf8004bb1b08374be4a9132b7b927d4de835a5dbf8a52514f6eb74d5",
+          "sha256": "722a0c56ed9b5493622db9b62f8fba5c1d7f6ad1263e9860a938b268636180fb",
           "parent_equal": false,
           "parent_differs_only_by": [
             "INSERT INTO GlobalMetadata VALUES('SimPeakShape','gaussian')",
             "INSERT INTO GlobalMetadata VALUES('SimEmgK','0.0')",
-            "INSERT INTO GlobalMetadata VALUES('SimNSigma','3.0')"
+            "INSERT INTO GlobalMetadata VALUES('SimNSigma','3.0')",
+            "Frames.Time / rt_seconds: the render now inherits the reference .d's own frame period instead of the hardcoded --cycle-seconds 0.1 default, which had been writing a 5.2%-compressed time axis into a file carrying that reference's own DIA windows and calibration. v1 has always read this off the reference (acquisition.py:177-184). Re-baselined 2026-08-10; analysis.tdf_bin is UNCHANGED and keeps its parent-equality claim, so the rendered signal is unaffected."
           ],
-          "dump_sha256_without_provenance": "6d185c5f73a373786cd86938f5024548ff8d493fd681dc8548ae0d7385469192"
+          "dump_sha256_without_provenance": "ed9ec38334c1de25a99e1813c7676128812844aded2a88f05b6fa4dca0181902"
         },
         {
           "path": "truth.parquet",
           "role": "signal+metadata",
           "hash": "parquet_data_sha256",
-          "sha256": "1050eceec7c60c15a9aad6f767255b7de6ab1f4359db7bcd4f809e94ad2437c5",
-          "parent_equal": true,
-          "file_sha256": "794ca2c6131f89266d8ca9c7fdcd20bb037ed5fd62d177996072c208a76f0146"
+          "sha256": "2f1c27aa27f58cb02d2c3356677ed4385110689d2208179f498d2975e47638b2",
+          "parent_equal": false,
+          "file_sha256": "70a59bf545564996e49503839ecd63096eb7fb06580eea13cee353bf6508fad4",
+          "parent_differs_only_by": [
+            "Frames.Time / rt_seconds: the render now inherits the reference .d's own frame period instead of the hardcoded --cycle-seconds 0.1 default, which had been writing a 5.2%-compressed time axis into a file carrying that reference's own DIA windows and calibration. v1 has always read this off the reference (acquisition.py:177-184). Re-baselined 2026-08-10; analysis.tdf_bin is UNCHANGED and keeps its parent-equality claim, so the rendered signal is unaffected."
+          ]
         }
       ]
     },
@@ -85,23 +108,45 @@
       "bin": "timsim-render",
       "args": [
         "--dda",
-        "--precursors", "{precursors}",
-        "--peptide-rt", "{peptide_rt}",
-        "--ion-spectra", "{ion_spectra}",
-        "--precursor-ccs", "{precursor_ccs}",
-        "--peptide-quantities", "{peptide_quantities}",
-        "--sample", "A_R1",
-        "--reference-d", "{reference_d}",
-        "--n-frames", "1200",
-        "--intensity-scale", "500000.0",
-        "--precursors-every", "10",
-        "--max-precursors", "25",
-        "--exclusion-width", "25",
-        "--out", "{out}/data.d",
-        "--dda-truth", "{out}/dda_truth.parquet",
-        "--peak-shape", "gaussian"
+        "--precursors",
+        "{precursors}",
+        "--peptide-rt",
+        "{peptide_rt}",
+        "--ion-spectra",
+        "{ion_spectra}",
+        "--precursor-ccs",
+        "{precursor_ccs}",
+        "--peptide-quantities",
+        "{peptide_quantities}",
+        "--sample",
+        "A_R1",
+        "--reference-d",
+        "{reference_d}",
+        "--n-frames",
+        "1200",
+        "--intensity-scale",
+        "500000.0",
+        "--precursors-every",
+        "10",
+        "--max-precursors",
+        "25",
+        "--exclusion-width",
+        "25",
+        "--out",
+        "{out}/data.d",
+        "--dda-truth",
+        "{out}/dda_truth.parquet",
+        "--peak-shape",
+        "gaussian"
       ],
-      "needs": ["precursors", "peptide_rt", "ion_spectra", "precursor_ccs", "peptide_quantities", "reference_d"],
+      "needs": [
+        "precursors",
+        "peptide_rt",
+        "ion_spectra",
+        "precursor_ccs",
+        "peptide_quantities",
+        "reference_d"
+      ],
       "artifacts": [
         {
           "path": "data.d/analysis.tdf_bin",
@@ -114,22 +159,26 @@
           "path": "data.d/analysis.tdf",
           "role": "signal+metadata",
           "hash": "file_sha256",
-          "sha256": "81827a220560209bc954a3f296ee5132da5e705feccb02951f08e1c7ab86e1e3",
+          "sha256": "a6d2ba24f099f9a20ddac4636a5a42f96e5d140b55154e3d20b1cef29fb1e3ef",
           "parent_equal": false,
           "parent_differs_only_by": [
             "INSERT INTO GlobalMetadata VALUES('SimPeakShape','gaussian')",
             "INSERT INTO GlobalMetadata VALUES('SimEmgK','0.0')",
-            "INSERT INTO GlobalMetadata VALUES('SimNSigma','3.0')"
+            "INSERT INTO GlobalMetadata VALUES('SimNSigma','3.0')",
+            "Frames.Time / rt_seconds: the render now inherits the reference .d's own frame period instead of the hardcoded --cycle-seconds 0.1 default, which had been writing a 5.2%-compressed time axis into a file carrying that reference's own DIA windows and calibration. v1 has always read this off the reference (acquisition.py:177-184). Re-baselined 2026-08-10; analysis.tdf_bin is UNCHANGED and keeps its parent-equality claim, so the rendered signal is unaffected."
           ],
-          "dump_sha256_without_provenance": "3dd786480a9b65b5893426801098d14676a9340f30b55c8e9b672b28ce3a6f96"
+          "dump_sha256_without_provenance": "aeb4b4fb67da3260fa59cc03b9563704c74d73afa1e16afea9b0bb916abd38d7"
         },
         {
           "path": "dda_truth.parquet",
           "role": "signal+metadata",
           "hash": "parquet_data_sha256",
-          "sha256": "3907965b6fa9e26866f41d906ce5e664ce33140b126aea5288bfc95e2726be2d",
-          "parent_equal": true,
-          "file_sha256": "95b29a63e8cb054d8b9c06cb635c6c3fcaf7bb1718fe6317bf6b36a4b7ba37a6"
+          "sha256": "927a041b560ab56741eaeef5d66314355d177f55f42eae7b8549bbedcffe9a56",
+          "parent_equal": false,
+          "file_sha256": "f0b96c982699b76e1461232b7e0eeedb8dcd3a77f9db69384c887eed567d7f4e",
+          "parent_differs_only_by": [
+            "Frames.Time / rt_seconds: the render now inherits the reference .d's own frame period instead of the hardcoded --cycle-seconds 0.1 default, which had been writing a 5.2%-compressed time axis into a file carrying that reference's own DIA windows and calibration. v1 has always read this off the reference (acquisition.py:177-184). Re-baselined 2026-08-10; analysis.tdf_bin is UNCHANGED and keeps its parent-equality claim, so the rendered signal is unaffected."
+          ]
         }
       ]
     },
@@ -137,23 +186,43 @@
       "name": "sciex",
       "bin": "timsim-render-sciex",
       "args": [
-        "--precursors", "{precursors}",
-        "--peptide-rt", "{peptide_rt}",
-        "--ion-spectra", "{ion_spectra}",
-        "--peptide-quantities", "{peptide_quantities}",
-        "--sample", "A_R1",
-        "--gradient-length-s", "600.0",
-        "--cycle-time-s", "3.0",
-        "--mz-min", "400.0",
-        "--mz-max", "1200.0",
-        "--window-width", "25.0",
-        "--collision-energy", "25.0",
-        "--intensity-scale", "500000.0",
-        "--out", "{out}/sciex.mzML",
-        "--truth", "{out}/truth.parquet",
-        "--peak-shape", "gaussian"
+        "--precursors",
+        "{precursors}",
+        "--peptide-rt",
+        "{peptide_rt}",
+        "--ion-spectra",
+        "{ion_spectra}",
+        "--peptide-quantities",
+        "{peptide_quantities}",
+        "--sample",
+        "A_R1",
+        "--gradient-length-s",
+        "600.0",
+        "--cycle-time-s",
+        "3.0",
+        "--mz-min",
+        "400.0",
+        "--mz-max",
+        "1200.0",
+        "--window-width",
+        "25.0",
+        "--collision-energy",
+        "25.0",
+        "--intensity-scale",
+        "500000.0",
+        "--out",
+        "{out}/sciex.mzML",
+        "--truth",
+        "{out}/truth.parquet",
+        "--peak-shape",
+        "gaussian"
       ],
-      "needs": ["precursors", "peptide_rt", "ion_spectra", "peptide_quantities"],
+      "needs": [
+        "precursors",
+        "peptide_rt",
+        "ion_spectra",
+        "peptide_quantities"
+      ],
       "artifacts": [
         {
           "path": "sciex.mzML",
@@ -176,20 +245,38 @@
       "name": "thermo",
       "bin": "timsim-render-thermo",
       "args": [
-        "--precursors", "{precursors}",
-        "--peptide-rt", "{peptide_rt}",
-        "--ion-spectra", "{ion_spectra}",
-        "--peptide-quantities", "{peptide_quantities}",
-        "--sample", "A_R1",
-        "--template", "{thermo_template}",
-        "--intensity-scale", "500000.0",
-        "--method", "DIA",
-        "--expected-ce", "25.0",
-        "--out", "{out}/data.raw",
-        "--thermo-truth", "{out}/truth.parquet",
-        "--peak-shape", "gaussian"
+        "--precursors",
+        "{precursors}",
+        "--peptide-rt",
+        "{peptide_rt}",
+        "--ion-spectra",
+        "{ion_spectra}",
+        "--peptide-quantities",
+        "{peptide_quantities}",
+        "--sample",
+        "A_R1",
+        "--template",
+        "{thermo_template}",
+        "--intensity-scale",
+        "500000.0",
+        "--method",
+        "DIA",
+        "--expected-ce",
+        "25.0",
+        "--out",
+        "{out}/data.raw",
+        "--thermo-truth",
+        "{out}/truth.parquet",
+        "--peak-shape",
+        "gaussian"
       ],
-      "needs": ["precursors", "peptide_rt", "ion_spectra", "peptide_quantities", "thermo_template"],
+      "needs": [
+        "precursors",
+        "peptide_rt",
+        "ion_spectra",
+        "peptide_quantities",
+        "thermo_template"
+      ],
       "artifacts": [
         {
           "path": "data.raw",

@@ -115,7 +115,16 @@ struct Args {
     im_max: f64,
     #[arg(long, default_value_t = 400_000)]
     digitizer_num_samples: u32,
-    #[arg(long, default_value_t = 0.1)]
+    /// Seconds per frame — the output's time axis is `frame_id * cycle_seconds`.
+    ///
+    /// `0` (the DEFAULT) inherits the reference `.d`'s own mean frame period, matching v1
+    /// (`acquisition.py:177-184`). Without a reference it falls back to 0.1.
+    ///
+    /// The old default of 0.1 was applied even in `--reference-d` mode, so a render replaying a
+    /// 0.105446 s/frame acquisition wrote a 5.2%-compressed clock into a file carrying that
+    /// reference's own DIA windows and calibration. Passing an explicit value still overrides, and
+    /// now warns when it disagrees with the reference.
+    #[arg(long, default_value_t = 0.0)]
     cycle_seconds: f64,
     #[arg(long, default_value_t = 100_000.0)]
     intensity_scale: f64,
@@ -270,9 +279,40 @@ struct Placement {
     reference_d: Option<String>,
     /// The reference `.d`'s own frame count — the run length to inherit when `--n-frames 0`.
     ref_n_frames: Option<u32>,
+    /// The reference's own frame period in seconds — the mean spacing of its `Frames.Time`.
+    /// `None` outside `--reference-d` mode, where `--cycle-seconds` is the only source.
+    ///
+    /// This exists because the render wrote its time axis as `frame_id * --cycle-seconds`, DEFAULT
+    /// 0.1, while replaying a reference acquired at a different rate — copying that reference's DIA
+    /// window table and mobility calibration into a file whose clock disagreed with it. On the
+    /// benchmark reference (0.105446 s/frame) a 1861.3 s acquisition reported itself as 1764.6 s: a
+    /// 5.2% compression, silent, in every Bruker render.
+    ///
+    /// v1 has always taken this from the reference — `acquisition.py:177-184`,
+    /// `rt_cycle_length = np.mean(np.diff(reference_ds.meta_data.Time))`. v2 inherited the frame
+    /// COUNT and the windows but not the clock, which is how the two came apart.
+    ref_cycle_seconds: Option<f64>,
     to_tof: Box<dyn Fn(f64) -> u32>,
     to_scan: Box<dyn Fn(f64) -> u32>,
     to_mz: Box<dyn Fn(u32) -> f64>,
+}
+
+/// The reference's mean frame period, or `None` if it cannot be measured or is not usable.
+///
+/// v1 uses `np.mean(np.diff(times))`, which is the SPAN over the interval count — insensitive to
+/// interior jitter and to whether the run starts at t=0 (this reference's first frame is at
+/// 0.733 s). Computed the same way here so the two agree by construction rather than by luck.
+///
+/// Returns `None` rather than a garbage period for a single-frame reference, a non-increasing
+/// time column, or a non-finite result: the caller then keeps `--cycle-seconds` and says so, which
+/// is a defensible fallback where silently writing `NaN` frame times is not.
+fn mean_frame_period(frames: &[ms_io::data::meta::FrameMeta]) -> Option<f64> {
+    if frames.len() < 2 {
+        return None;
+    }
+    let span = frames.last()?.time - frames.first()?.time;
+    let period = span / (frames.len() - 1) as f64;
+    (period.is_finite() && period > 0.0).then_some(period)
 }
 
 fn build_placement(a: &Args) -> Result<Placement> {
@@ -323,6 +363,7 @@ fn build_placement(a: &Args) -> Result<Placement> {
                 im_max: gm.one_over_k0_range_upper,
                 reference_d: Some(ref_s),
                 ref_n_frames: Some(frames.len() as u32),
+                ref_cycle_seconds: mean_frame_period(&frames),
                 to_tof: Box::new(move |m| mz_for_tof.mz_to_tof(m)),
                 to_scan: Box::new(move |k0| mob.one_over_k0_to_scan(k0)),
                 to_mz: Box::new(move |tof| mz.tof_to_mz(tof)),
@@ -343,6 +384,7 @@ fn build_placement(a: &Args) -> Result<Placement> {
                 im_max: a.im_max,
                 reference_d: None,
                 ref_n_frames: None,
+                ref_cycle_seconds: None,
                 // tof = (sqrt(mz) - tof_intercept) / tof_slope ; scan = (1/K0 - scan_intercept) / scan_slope
                 to_tof: Box::new(move |m| ((m.sqrt() - tof_intercept) / tof_slope).max(0.0) as u32),
                 to_scan: Box::new(move |k0| ((k0 - scan_intercept) / scan_slope).max(0.0) as u32),
@@ -440,6 +482,39 @@ fn main() -> Result<()> {
             a.n_frames,
             if p.ref_n_frames.is_some() { "inherited from reference .d" } else { "default (no reference)" }
         );
+    }
+    // Resolve the frame CLOCK the same way, and for the same reason. `--cycle-seconds 0` inherits the
+    // reference's own mean frame period; without a reference it falls back to the historical 0.1.
+    //
+    // This was a real defect, not a tidy-up: the old default wrote every Bruker render's time axis as
+    // `frame_id * 0.1` regardless of the reference, so a 1861.3 s acquisition (0.105446 s/frame) came
+    // out declaring 1764.6 s — a 5.2% compression — in a file that had copied that same reference's
+    // DIA window table and mobility calibration. The output disagreed with the instrument it claimed
+    // to be replaying, and nothing said so. v1 reads this off the reference and always has
+    // (`acquisition.py:177-184`).
+    //
+    // A positive `--cycle-seconds` is still an explicit override and still wins, so a caller who
+    // deliberately wants a different clock keeps it.
+    if a.cycle_seconds == 0.0 {
+        a.cycle_seconds = p.ref_cycle_seconds.unwrap_or(0.1);
+        eprintln!(
+            "  cycle_seconds = {:.6} ({}) -> gradient {:.1} s",
+            a.cycle_seconds,
+            if p.ref_cycle_seconds.is_some() { "inherited from reference .d" } else { "default (no reference)" },
+            a.n_frames as f64 * a.cycle_seconds,
+        );
+    } else if let Some(rc) = p.ref_cycle_seconds {
+        // Honour it, but never let a silent disagreement with the reference pass unremarked — that
+        // silence is precisely what hid the 5.2% error.
+        let dev = (a.cycle_seconds - rc).abs() / rc;
+        if dev > 1e-6 {
+            eprintln!(
+                "  WARNING: --cycle-seconds {:.6} differs from the reference's own {:.6} by {:.2}% — \
+                 the output's time axis will NOT match the reference it replays. Use --cycle-seconds 0 \
+                 to inherit.",
+                a.cycle_seconds, rc, dev * 100.0
+            );
+        }
     }
     // Spike-into requires an exact 1:1 output↔real frame mapping — reject any n_frames != the real count
     // (use `--n-frames 0` to inherit it). Otherwise `get_frame(f)` would not be the real f-th frame.
