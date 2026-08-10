@@ -124,6 +124,64 @@ pub struct Emg {
 /// giving `k = 0.72 / 1.5128 = 0.476` — i.e. exactly 10/21.
 pub const V1_DEFAULT_EMG_K: f64 = 10.0 / 21.0;
 
+/// v1's upper bound on the EMG tailing draw: `k = k_lower + k_hat*(k_upper - k_lower)` with
+/// `k_lower_rt = 0`, `k_upper_rt = 10` (`simulator.py:414-417`). `k_hat ~ Beta(1,20)`, so
+/// `E[k] = 10/21` — which is exactly [`V1_DEFAULT_EMG_K`], the constant used when a run has no
+/// per-peptide draw to read.
+pub const V1_K_UPPER: f64 = 10.0;
+
+/// v1's gradient-derived elution-width band, in SECONDS.
+///
+/// ```text
+///   sigma_mid = gradient_seconds / 3600 * 0.75 + 1.125
+///   band      = [0.75 * sigma_mid, 1.25 * sigma_mid]
+/// ```
+///
+/// from `calculate_rt_defaults` (`simulate_frame_distributions_emg.py:11-29`). The `/3600` converts
+/// the gradient to HOURS, so the slope is "0.75 s of peak width per hour of gradient".
+///
+/// **This is AFFINE, not proportional, and the intercept dominates.** A 6x longer gradient widens
+/// peaks by only 1.71x:
+///
+/// | gradient | sigma_mid |
+/// |---|---|
+/// | 900 s | 1.3125 s |
+/// | 1861 s | 1.5125 s |
+/// | 3600 s | 1.875 s |
+/// | 5400 s | 2.25 s |
+///
+/// which is what better chromatography actually does — a longer gradient gives *relatively*
+/// narrower peaks. Porting this as a proportional law would be as wrong as the fixed frame count it
+/// replaces, just in the other direction.
+///
+/// Returned in seconds because that is the only frame the formula is meaningful in; the caller
+/// divides by the run's frame period to reach frames. v2 anchors elution in FRAMES, so a width
+/// expressed in frames silently tracks the acquisition RATE rather than the gradient — run a faster
+/// cycle and the peaks would narrow in time, which v1's would not.
+pub fn rt_sigma_band_seconds(gradient_seconds: f64) -> (f64, f64) {
+    let mid = gradient_seconds / 3600.0 * 0.75 + 1.125;
+    (mid * 0.75, mid * 1.25)
+}
+
+/// Map a peptide's unit draws onto this run: `(sigma_frames, k)`.
+///
+/// `sigma_hat` and `k_hat` are the Beta draws `timsim-rt` stores in `peptide_rt` — `Beta(4,4)` and
+/// `Beta(1,20)`, v1's own distributions (`simulator.py:410-417`), identity-keyed on the sequence.
+/// v1 drew the ABSOLUTE width per run from a global `np.random` stream, so a peptide's width moved
+/// when unrelated peptides were added; storing the unit draw and applying the gradient here keeps
+/// the peptide's relative shape fixed and reproducible while still letting the run's gradient
+/// reshape the absolute peak.
+///
+/// `k` can legitimately come back 0: v1's `k_lower_rt` is 0 and `Beta(1,20)` has real mass near
+/// zero. That is the Gaussian limit, and the caller must treat it as such rather than as an error —
+/// [`PeakShape::emg`] rejects `k <= 0`, so feeding this straight in would fail mid-run on whichever
+/// peptide happened to draw small.
+pub fn rt_shape_for_peptide(sigma_hat: f64, k_hat: f64, gradient_seconds: f64, cycle_seconds: f64) -> (f64, f64) {
+    let (lo, hi) = rt_sigma_band_seconds(gradient_seconds);
+    let sigma_seconds = lo + sigma_hat * (hi - lo);
+    (sigma_seconds / cycle_seconds, k_hat * V1_K_UPPER)
+}
+
 /// Numerical-Recipes `erfc`, scaled by `exp(x^2)` — i.e. `erfcx(x) = exp(x^2) * erfc(x)`.
 ///
 /// This is **v1's own erf** (`mscore::algorithm::utility::erf`, the same rational/Chebyshev form),
@@ -1333,6 +1391,66 @@ mod tests {
         assert!(matches!(Emg::new(0.0, 3.0), Err(PeakShapeError::NotPositive { .. })));
     }
 
+    /// v1's gradient→width law, pinned against values computed from its own formula.
+    ///
+    /// The point of the table is the SHAPE of the dependence, not one number: it is affine with a
+    /// dominant intercept, so a 6x gradient change moves sigma by 1.71x. A port that made this
+    /// proportional would pass a single-point check and be badly wrong everywhere else.
+    #[test]
+    fn v1_gradient_width_law() {
+        for (gradient, mid) in [(900.0, 1.3125), (1860.0, 1.5125), (3600.0, 1.875), (5400.0, 2.25)] {
+            let (lo, hi) = rt_sigma_band_seconds(gradient);
+            assert!((lo - mid * 0.75).abs() < 1e-12 && (hi - mid * 1.25).abs() < 1e-12,
+                "gradient {gradient}: band ({lo}, {hi}) != +/-25% of {mid}");
+            // Beta(4,4) is symmetric with mean 0.5, so E[sigma] is the midpoint exactly.
+            let (mean_sigma, _) = rt_shape_for_peptide(0.5, 0.0, gradient, 1.0);
+            assert!((mean_sigma - mid).abs() < 1e-12, "gradient {gradient}: E[sigma] {mean_sigma} != {mid}");
+        }
+        // Affine, NOT proportional: 6x the gradient must NOT give 6x the width.
+        let (lo9, hi9) = rt_sigma_band_seconds(900.0);
+        let (lo54, hi54) = rt_sigma_band_seconds(5400.0);
+        let ratio = (lo54 + hi54) / (lo9 + hi9);
+        assert!((ratio - 1.7143).abs() < 1e-3, "6x gradient gave {ratio}x width, expected ~1.71x");
+    }
+
+    /// The unit draws must land where v1's absolute draws did — including at the edges.
+    #[test]
+    fn unit_draws_reproduce_v1s_population() {
+        // The benchmark acquisition: 1861.3 s over 17,646 frames.
+        let (gradient, cycle) = (1861.3, 0.105445749226364);
+        // sigma_hat spans the band; at the mean draw it is the midpoint.
+        let (s_lo, _) = rt_shape_for_peptide(0.0, 0.0, gradient, cycle);
+        let (s_mid, _) = rt_shape_for_peptide(0.5, 0.0, gradient, cycle);
+        let (s_hi, _) = rt_shape_for_peptide(1.0, 0.0, gradient, cycle);
+        assert!(s_lo < s_mid && s_mid < s_hi, "band must be ordered: {s_lo} {s_mid} {s_hi}");
+        // ~14.3 frames at the mean, against the 30 this render used before the draws were wired.
+        assert!((s_mid - 14.34).abs() < 0.05, "mean width {s_mid} frames, expected ~14.34");
+        assert!((s_lo / s_mid - 0.75).abs() < 1e-9 && (s_hi / s_mid - 1.25).abs() < 1e-9);
+
+        // k spans [0, 10] and its mean draw is v1's mean, which is the no-draw default.
+        assert_eq!(rt_shape_for_peptide(0.5, 0.0, gradient, cycle).1, 0.0);
+        assert_eq!(rt_shape_for_peptide(0.5, 1.0, gradient, cycle).1, V1_K_UPPER);
+        // E[k_hat] for Beta(1,20) is 1/21, so E[k] = 10/21 = the constant used without a draw.
+        let (_, k_mean) = rt_shape_for_peptide(0.5, 1.0 / 21.0, gradient, cycle);
+        assert!((k_mean - V1_DEFAULT_EMG_K).abs() < 1e-12, "E[k] {k_mean} != {V1_DEFAULT_EMG_K}");
+    }
+
+    /// The gradient must reach the width through SECONDS, not frames.
+    ///
+    /// Two runs over the same gradient at different acquisition rates must produce the same peak
+    /// width IN TIME, and therefore different widths in frames. Anchoring the width in frames — as
+    /// `--sigma-frames` did — inverts this: the peak would narrow in time as the cycle got faster,
+    /// which is not a property of chromatography.
+    #[test]
+    fn width_tracks_the_gradient_not_the_acquisition_rate() {
+        let gradient = 1861.3;
+        let (fast, slow) = (0.05, 0.2);
+        let (sf_fast, _) = rt_shape_for_peptide(0.5, 0.0, gradient, fast);
+        let (sf_slow, _) = rt_shape_for_peptide(0.5, 0.0, gradient, slow);
+        assert!((sf_fast * fast - sf_slow * slow).abs() < 1e-12, "width in SECONDS must be rate-invariant");
+        assert!((sf_fast / sf_slow - slow / fast).abs() < 1e-9, "width in FRAMES must scale with rate");
+    }
+
     /// Only the documented subnormal collapse may downgrade an EMG request to a Gaussian.
     ///
     /// This pins the fix for a review finding: `PeakShape::emg` used to absorb EVERY `Emg::new`
@@ -1557,4 +1675,5 @@ mod tests {
         ));
     }
 }
+
 
