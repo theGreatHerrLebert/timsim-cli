@@ -172,14 +172,53 @@ pub fn rt_sigma_band_seconds(gradient_seconds: f64) -> (f64, f64) {
 /// the peptide's relative shape fixed and reproducible while still letting the run's gradient
 /// reshape the absolute peak.
 ///
-/// `k` can legitimately come back 0: v1's `k_lower_rt` is 0 and `Beta(1,20)` has real mass near
-/// zero. That is the Gaussian limit, and the caller must treat it as such rather than as an error —
-/// [`PeakShape::emg`] rejects `k <= 0`, so feeding this straight in would fail mid-run on whichever
-/// peptide happened to draw small.
-pub fn rt_shape_for_peptide(sigma_hat: f64, k_hat: f64, gradient_seconds: f64, cycle_seconds: f64) -> (f64, f64) {
+/// Returns the peptide's own [`PeakShape`], not a bare `k`, because `k = 0` is REACHABLE and is the
+/// Gaussian limit rather than an error: v1's `k_lower_rt` is 0 and `Beta(1,20)` puts real mass near
+/// zero. [`PeakShape::emg`] rejects `k <= 0`, so a signature returning `f64` would put a special
+/// case at every call site and fail mid-run on whichever peptide first drew small. Handing back the
+/// resolved shape makes the collapse happen once, here, by construction — the same reason
+/// [`PeakShapeError::DegeneratesToGaussian`] exists rather than a comment telling callers to check.
+///
+/// Every input is validated. This is foundation code reading numbers out of a parquet file: an
+/// out-of-range draw would be EXTRAPOLATED into a peak outside v1's band, and a zero
+/// `cycle_seconds` would produce an infinite width, both silently.
+pub fn rt_shape_for_peptide(
+    sigma_hat: f64,
+    k_hat: f64,
+    gradient_seconds: f64,
+    cycle_seconds: f64,
+    n_sigma: f64,
+) -> Result<(f64, PeakShape), PeakShapeError> {
+    require_unit_draw("rt_sigma_hat", sigma_hat)?;
+    require_unit_draw("rt_k_hat", k_hat)?;
+    if !gradient_seconds.is_finite() {
+        return Err(PeakShapeError::NotFinite { name: "gradient-seconds", value: gradient_seconds });
+    }
+    if gradient_seconds < 0.0 {
+        return Err(PeakShapeError::Negative { name: "gradient-seconds", value: gradient_seconds });
+    }
+    if !cycle_seconds.is_finite() {
+        return Err(PeakShapeError::NotFinite { name: "cycle-seconds", value: cycle_seconds });
+    }
+    if cycle_seconds <= 0.0 {
+        return Err(PeakShapeError::NotPositive { name: "cycle-seconds", value: cycle_seconds });
+    }
     let (lo, hi) = rt_sigma_band_seconds(gradient_seconds);
-    let sigma_seconds = lo + sigma_hat * (hi - lo);
-    (sigma_seconds / cycle_seconds, k_hat * V1_K_UPPER)
+    let sigma_frames = (lo + sigma_hat * (hi - lo)) / cycle_seconds;
+    let k = k_hat * V1_K_UPPER;
+    // k == 0 IS the Gaussian; anything else that fails to build a usable EMG must surface.
+    let shape = if k > 0.0 { PeakShape::emg(k, n_sigma)? } else { PeakShape::Gaussian };
+    Ok((sigma_frames, shape))
+}
+
+fn require_unit_draw(name: &'static str, v: f64) -> Result<(), PeakShapeError> {
+    if !v.is_finite() {
+        return Err(PeakShapeError::NotFinite { name, value: v });
+    }
+    if !(0.0..=1.0).contains(&v) {
+        return Err(PeakShapeError::NotAUnitDraw { name, value: v });
+    }
+    Ok(())
 }
 
 /// Numerical-Recipes `erfc`, scaled by `exp(x^2)` — i.e. `erfcx(x) = exp(x^2) * erfc(x)`.
@@ -327,6 +366,13 @@ pub enum PeakShapeError {
     /// deviations wide, far outside any chromatography, and the alternative is a wrong render that
     /// certifies itself as correct.
     TruncationUnrepresentable { n_sigma: f64 },
+    /// A stored unit draw is outside `[0, 1]`.
+    ///
+    /// `rt_sigma_hat`/`rt_k_hat` are Beta draws and so are unit-bounded by construction. A value
+    /// outside the range means the artifact was not written by `timsim-rt` (or was corrupted), and
+    /// the affine map would happily EXTRAPOLATE it — `sigma_hat = 3` silently produces a peak
+    /// outside v1's band rather than failing. Refuse instead of inventing chromatography.
+    NotAUnitDraw { name: &'static str, value: f64 },
 }
 
 impl std::fmt::Display for PeakShapeError {
@@ -344,6 +390,11 @@ impl std::fmt::Display for PeakShapeError {
                 "--n-sigma = {n_sigma} is too large: the tail mass it truncates at, \
                  0.5*erfc({n_sigma}/sqrt2), is not a normal f64, so the peak's right edge \
                  cannot be placed (use --n-sigma <= 37)"
+            ),
+            PeakShapeError::NotAUnitDraw { name, value } => write!(
+                f,
+                "{name} = {value} is not a unit Beta draw in [0, 1] — peptide_rt was not written by \
+                 timsim-rt, or is corrupt"
             ),
         }
     }
@@ -1403,7 +1454,7 @@ mod tests {
             assert!((lo - mid * 0.75).abs() < 1e-12 && (hi - mid * 1.25).abs() < 1e-12,
                 "gradient {gradient}: band ({lo}, {hi}) != +/-25% of {mid}");
             // Beta(4,4) is symmetric with mean 0.5, so E[sigma] is the midpoint exactly.
-            let (mean_sigma, _) = rt_shape_for_peptide(0.5, 0.0, gradient, 1.0);
+            let (mean_sigma, _) = rt_shape_for_peptide(0.5, 0.0, gradient, 1.0, 3.0).unwrap();
             assert!((mean_sigma - mid).abs() < 1e-12, "gradient {gradient}: E[sigma] {mean_sigma} != {mid}");
         }
         // Affine, NOT proportional: 6x the gradient must NOT give 6x the width.
@@ -1419,20 +1470,63 @@ mod tests {
         // The benchmark acquisition: 1861.3 s over 17,646 frames.
         let (gradient, cycle) = (1861.3, 0.105445749226364);
         // sigma_hat spans the band; at the mean draw it is the midpoint.
-        let (s_lo, _) = rt_shape_for_peptide(0.0, 0.0, gradient, cycle);
-        let (s_mid, _) = rt_shape_for_peptide(0.5, 0.0, gradient, cycle);
-        let (s_hi, _) = rt_shape_for_peptide(1.0, 0.0, gradient, cycle);
+        let (s_lo, _) = rt_shape_for_peptide(0.0, 0.5, gradient, cycle, 3.0).unwrap();
+        let (s_mid, _) = rt_shape_for_peptide(0.5, 0.5, gradient, cycle, 3.0).unwrap();
+        let (s_hi, _) = rt_shape_for_peptide(1.0, 0.5, gradient, cycle, 3.0).unwrap();
         assert!(s_lo < s_mid && s_mid < s_hi, "band must be ordered: {s_lo} {s_mid} {s_hi}");
         // ~14.3 frames at the mean, against the 30 this render used before the draws were wired.
         assert!((s_mid - 14.34).abs() < 0.05, "mean width {s_mid} frames, expected ~14.34");
         assert!((s_lo / s_mid - 0.75).abs() < 1e-9 && (s_hi / s_mid - 1.25).abs() < 1e-9);
 
-        // k spans [0, 10] and its mean draw is v1's mean, which is the no-draw default.
-        assert_eq!(rt_shape_for_peptide(0.5, 0.0, gradient, cycle).1, 0.0);
-        assert_eq!(rt_shape_for_peptide(0.5, 1.0, gradient, cycle).1, V1_K_UPPER);
-        // E[k_hat] for Beta(1,20) is 1/21, so E[k] = 10/21 = the constant used without a draw.
-        let (_, k_mean) = rt_shape_for_peptide(0.5, 1.0 / 21.0, gradient, cycle);
-        assert!((k_mean - V1_DEFAULT_EMG_K).abs() < 1e-12, "E[k] {k_mean} != {V1_DEFAULT_EMG_K}");
+        // E[k_hat] for Beta(1,20) is 1/21, so E[k] = 10/21 — the constant used without a draw.
+        // Checked THROUGH the returned shape, since `k` is no longer handed out raw.
+        match rt_shape_for_peptide(0.5, 1.0 / 21.0, gradient, cycle, 3.0).unwrap().1 {
+            PeakShape::Emg(e) => assert!((e.k() - V1_DEFAULT_EMG_K).abs() < 1e-12, "E[k] {} != {V1_DEFAULT_EMG_K}", e.k()),
+            s => panic!("mean draw must be an EMG, got {s:?}"),
+        }
+        match rt_shape_for_peptide(0.5, 1.0, gradient, cycle, 3.0).unwrap().1 {
+            PeakShape::Emg(e) => assert!((e.k() - V1_K_UPPER).abs() < 1e-12),
+            s => panic!("k_hat=1 must be an EMG at k=10, got {s:?}"),
+        }
+    }
+
+    /// `k_hat = 0` is REACHABLE — v1's `k_lower_rt` is 0 and `Beta(1,20)` has mass near zero — and
+    /// it is the Gaussian limit, not an error.
+    ///
+    /// This is the type doing the work that a doc comment used to: an earlier signature returned a
+    /// bare `k`, so every call site had to remember that `PeakShape::emg` rejects `k <= 0`. That
+    /// fails mid-run on whichever peptide first draws small, which on a real proteome is a matter of
+    /// when, not if.
+    #[test]
+    fn a_zero_tail_draw_is_a_gaussian_not_an_error() {
+        let (sigma, shape) = rt_shape_for_peptide(0.5, 0.0, 1861.3, 0.105445749226364, 3.0).unwrap();
+        assert_eq!(shape, PeakShape::Gaussian, "k_hat=0 must resolve to the Gaussian limit");
+        assert!(sigma > 0.0 && sigma.is_finite());
+        // The width is unaffected by the tail collapsing — only the shape is.
+        let (sigma_tailed, _) = rt_shape_for_peptide(0.5, 0.5, 1861.3, 0.105445749226364, 3.0).unwrap();
+        assert!((sigma - sigma_tailed).abs() < 1e-12);
+    }
+
+    /// Foundation code reading numbers off disk must refuse garbage rather than extrapolate it.
+    #[test]
+    fn rt_shape_rejects_inputs_it_cannot_honour() {
+        let (g, c) = (1861.3, 0.1);
+        // Unit draws are Beta draws; outside [0,1] the affine map EXTRAPOLATES silently.
+        for bad in [-0.001, 1.001, 3.0, f64::NAN, f64::INFINITY] {
+            assert!(rt_shape_for_peptide(bad, 0.5, g, c, 3.0).is_err(), "sigma_hat={bad} must be refused");
+            assert!(rt_shape_for_peptide(0.5, bad, g, c, 3.0).is_err(), "k_hat={bad} must be refused");
+        }
+        // A zero or negative cycle makes the width infinite or negative.
+        for bad in [0.0, -0.1, f64::NAN, f64::INFINITY] {
+            assert!(rt_shape_for_peptide(0.5, 0.5, g, bad, 3.0).is_err(), "cycle_seconds={bad} must be refused");
+        }
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(rt_shape_for_peptide(0.5, 0.5, bad, c, 3.0).is_err(), "gradient={bad} must be refused");
+        }
+        // A zero gradient is degenerate but mathematically defined (the 1.125 s intercept), and a
+        // 0-length run is rejected upstream — so it is ACCEPTED here rather than special-cased.
+        let (s, _) = rt_shape_for_peptide(0.5, 0.5, 0.0, c, 3.0).unwrap();
+        assert!((s - 1.125 / c).abs() < 1e-9, "gradient=0 must give the bare intercept, got {s}");
     }
 
     /// The gradient must reach the width through SECONDS, not frames.
@@ -1445,8 +1539,8 @@ mod tests {
     fn width_tracks_the_gradient_not_the_acquisition_rate() {
         let gradient = 1861.3;
         let (fast, slow) = (0.05, 0.2);
-        let (sf_fast, _) = rt_shape_for_peptide(0.5, 0.0, gradient, fast);
-        let (sf_slow, _) = rt_shape_for_peptide(0.5, 0.0, gradient, slow);
+        let (sf_fast, _) = rt_shape_for_peptide(0.5, 0.5, gradient, fast, 3.0).unwrap();
+        let (sf_slow, _) = rt_shape_for_peptide(0.5, 0.5, gradient, slow, 3.0).unwrap();
         assert!((sf_fast * fast - sf_slow * slow).abs() < 1e-12, "width in SECONDS must be rate-invariant");
         assert!((sf_fast / sf_slow - slow / fast).abs() < 1e-9, "width in FRAMES must scale with rate");
     }

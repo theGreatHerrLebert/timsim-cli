@@ -280,7 +280,9 @@ struct Placement {
     /// The reference `.d`'s own frame count — the run length to inherit when `--n-frames 0`.
     ref_n_frames: Option<u32>,
     /// The reference's own frame period in seconds — the mean spacing of its `Frames.Time`.
-    /// `None` outside `--reference-d` mode, where `--cycle-seconds` is the only source.
+    /// `None` outside `--reference-d` mode; `Err` when a reference WAS supplied but its time column
+    /// could not be measured, so the fallback can say which of the two happened instead of
+    /// reporting "no reference" for a reference that was there and unusable.
     ///
     /// This exists because the render wrote its time axis as `frame_id * --cycle-seconds`, DEFAULT
     /// 0.1, while replaying a reference acquired at a different rate — copying that reference's DIA
@@ -291,7 +293,7 @@ struct Placement {
     /// v1 has always taken this from the reference — `acquisition.py:177-184`,
     /// `rt_cycle_length = np.mean(np.diff(reference_ds.meta_data.Time))`. v2 inherited the frame
     /// COUNT and the windows but not the clock, which is how the two came apart.
-    ref_cycle_seconds: Option<f64>,
+    ref_cycle_seconds: Option<Result<f64, String>>,
     to_tof: Box<dyn Fn(f64) -> u32>,
     to_scan: Box<dyn Fn(f64) -> u32>,
     to_mz: Box<dyn Fn(u32) -> f64>,
@@ -299,20 +301,39 @@ struct Placement {
 
 /// The reference's mean frame period, or `None` if it cannot be measured or is not usable.
 ///
-/// v1 uses `np.mean(np.diff(times))`, which is the SPAN over the interval count — insensitive to
-/// interior jitter and to whether the run starts at t=0 (this reference's first frame is at
-/// 0.733 s). Computed the same way here so the two agree by construction rather than by luck.
+/// v1 uses `np.mean(np.diff(times))`. That telescopes to the SPAN over the interval count, so the
+/// two are algebraically identical for the same ordered timestamps — including under jitter or
+/// gaps — and insensitive to whether the run starts at t=0 (this reference's first frame is at
+/// 0.733 s). They agree to within floating-point evaluation order, not bit-for-bit.
 ///
-/// Returns `None` rather than a garbage period for a single-frame reference, a non-increasing
-/// time column, or a non-finite result: the caller then keeps `--cycle-seconds` and says so, which
-/// is a defensible fallback where silently writing `NaN` frame times is not.
-fn mean_frame_period(frames: &[ms_io::data::meta::FrameMeta]) -> Option<f64> {
+/// **This renderer's invariant is a UNIFORM clock**: the output writes `frame_id * period`. A
+/// reference containing a real acquisition pause, or MS1/MS2 interleaved at unequal cadence, has
+/// its local timing folded into one average, and the output's frame times then differ from the
+/// reference's frame-by-frame. That is a deliberate v1-compatibility choice, not an oversight — but
+/// it means "inherited from the reference" is a claim about the mean rate, not the schedule.
+///
+/// Every adjacent interval is checked, not just the span. The span alone accepts a non-monotonic or
+/// duplicated time column — `[0, 1, 0.5, 2]` averages to a perfectly plausible 0.667 — and would
+/// turn a corrupt reference into a confident synthetic clock, which is the failure mode this whole
+/// function exists to prevent.
+fn mean_frame_period(frames: &[ms_io::data::meta::FrameMeta]) -> Result<f64, String> {
     if frames.len() < 2 {
-        return None;
+        return Err(format!("only {} frame(s); need at least 2 to measure a period", frames.len()));
     }
-    let span = frames.last()?.time - frames.first()?.time;
-    let period = span / (frames.len() - 1) as f64;
-    (period.is_finite() && period > 0.0).then_some(period)
+    for (i, w) in frames.windows(2).enumerate() {
+        let d = w[1].time - w[0].time;
+        if !d.is_finite() || d <= 0.0 {
+            return Err(format!(
+                "Frames.Time is not strictly increasing at frame index {i}: {} -> {} (delta {d})",
+                w[0].time, w[1].time
+            ));
+        }
+    }
+    let period = (frames[frames.len() - 1].time - frames[0].time) / (frames.len() - 1) as f64;
+    if !period.is_finite() || period <= 0.0 {
+        return Err(format!("computed a non-usable frame period ({period})"));
+    }
+    Ok(period)
 }
 
 fn build_placement(a: &Args) -> Result<Placement> {
@@ -363,7 +384,7 @@ fn build_placement(a: &Args) -> Result<Placement> {
                 im_max: gm.one_over_k0_range_upper,
                 reference_d: Some(ref_s),
                 ref_n_frames: Some(frames.len() as u32),
-                ref_cycle_seconds: mean_frame_period(&frames),
+                ref_cycle_seconds: Some(mean_frame_period(&frames)),
                 to_tof: Box::new(move |m| mz_for_tof.mz_to_tof(m)),
                 to_scan: Box::new(move |k0| mob.one_over_k0_to_scan(k0)),
                 to_mz: Box::new(move |tof| mz.tof_to_mz(tof)),
@@ -495,21 +516,49 @@ fn main() -> Result<()> {
     //
     // A positive `--cycle-seconds` is still an explicit override and still wins, so a caller who
     // deliberately wants a different clock keeps it.
+    //
+    // Validated BEFORE the sentinel test, because `NaN` compares false against everything: it is
+    // neither `== 0.0` nor `> 0.0`, so it would slip past both branches below and reach every
+    // `frame_id * cycle_seconds` write, producing NaN frame times with no warning at all.
+    if !a.cycle_seconds.is_finite() || a.cycle_seconds < 0.0 {
+        return Err(anyhow!(
+            "--cycle-seconds must be finite and >= 0 (0 = inherit from --reference-d); got {}",
+            a.cycle_seconds
+        ));
+    }
     if a.cycle_seconds == 0.0 {
-        a.cycle_seconds = p.ref_cycle_seconds.unwrap_or(0.1);
-        eprintln!(
-            "  cycle_seconds = {:.6} ({}) -> gradient {:.1} s",
-            a.cycle_seconds,
-            if p.ref_cycle_seconds.is_some() { "inherited from reference .d" } else { "default (no reference)" },
-            a.n_frames as f64 * a.cycle_seconds,
-        );
-    } else if let Some(rc) = p.ref_cycle_seconds {
-        // Honour it, but never let a silent disagreement with the reference pass unremarked — that
-        // silence is precisely what hid the 5.2% error.
+        a.cycle_seconds = match &p.ref_cycle_seconds {
+            Some(Ok(rc)) => {
+                eprintln!("  cycle_seconds = {rc:.9} (inherited from reference .d)");
+                *rc
+            }
+            // A reference was given and could NOT be measured. Distinguishing this from "no
+            // reference" is the whole point of carrying the reason: the operator needs to know their
+            // reference was unusable, not be told they did not supply one.
+            Some(Err(why)) => {
+                eprintln!(
+                    "  WARNING: --cycle-seconds 0 asked to inherit the reference's clock, but it \
+                     could not be measured ({why}). Falling back to 0.1 s/frame, which will NOT \
+                     match the reference."
+                );
+                0.1
+            }
+            None => {
+                eprintln!("  cycle_seconds = 0.100000 (default, no reference)");
+                0.1
+            }
+        };
+        eprintln!("  -> gradient {:.1} s over {} frames", a.n_frames as f64 * a.cycle_seconds, a.n_frames);
+    } else if let Some(Ok(rc)) = &p.ref_cycle_seconds {
+        // Honour the override, but never let a silent disagreement with the reference pass
+        // unremarked — that silence is precisely what hid the 5.2% error.
+        //
+        // 1e-4 (0.01%), not 1e-6: a caller who types a rounded 0.105446 against a true
+        // 0.105445749 deviates by 2.4e-6 and does not need to be shouted at for it.
         let dev = (a.cycle_seconds - rc).abs() / rc;
-        if dev > 1e-6 {
+        if dev > 1e-4 {
             eprintln!(
-                "  WARNING: --cycle-seconds {:.6} differs from the reference's own {:.6} by {:.2}% — \
+                "  WARNING: --cycle-seconds {:.9} differs from the reference's own {:.9} by {:.3}% — \
                  the output's time axis will NOT match the reference it replays. Use --cycle-seconds 0 \
                  to inherit.",
                 a.cycle_seconds, rc, dev * 100.0
@@ -2187,6 +2236,82 @@ fn verify(dir: &std::path::Path, p: &Placement) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::mean_frame_period;
+    use ms_io::data::meta::FrameMeta;
+
+    fn frames(times: &[f64]) -> Vec<FrameMeta> {
+        times
+            .iter()
+            .enumerate()
+            .map(|(i, &time)| FrameMeta {
+                id: i as i64 + 1,
+                time,
+                polarity: "+".into(),
+                scan_mode: 9,
+                ms_ms_type: 0,
+                tims_id: 0,
+                max_intensity: 0.0,
+                sum_intensity: 0.0,
+                num_scans: 927,
+                num_peaks: 0,
+                mz_calibration: 1,
+                t_1: 0.0,
+                t_2: 0.0,
+                tims_calibration: 1,
+                property_group: 0,
+                accumulation_time: 0.0,
+                ramp_time: 0.0,
+            })
+            .collect()
+    }
+
+    /// The period is the SPAN over the interval count — v1's `mean(np.diff(times))` telescoped.
+    ///
+    /// Pinned against the real benchmark reference: 5692 frames, 0.105445742607117 to
+    /// 600.197204589844 s. A run does NOT start at t=0 (this one starts at 0.105 s), which is
+    /// exactly why the estimator must not be `last / n`.
+    #[test]
+    fn period_is_the_span_over_the_interval_count() {
+        let f = frames(&[0.105445742607117, 300.0, 600.197204589844]);
+        let got = mean_frame_period(&f).unwrap();
+        let want = (600.197204589844 - 0.105445742607117) / 2.0;
+        assert!((got - want).abs() < 1e-12, "{got} != {want}");
+
+        // Jitter and gaps telescope away — the same property v1 relies on.
+        let even = mean_frame_period(&frames(&[0.0, 1.0, 2.0, 3.0])).unwrap();
+        let jittery = mean_frame_period(&frames(&[0.0, 0.4, 2.9, 3.0])).unwrap();
+        assert!((even - jittery).abs() < 1e-12, "span-based estimator must ignore interior spacing");
+    }
+
+    /// A malformed time column must be REFUSED, not averaged into a plausible clock.
+    ///
+    /// This is the case a span-only check misses, and it is the one that matters: `[0, 1, 0.5, 2]`
+    /// averages to 0.667 s/frame, which looks entirely reasonable. Writing that as `frame_id *
+    /// 0.667` would turn a corrupt reference into a confident synthetic clock — the exact failure
+    /// this function exists to prevent, dressed up as success.
+    #[test]
+    fn a_malformed_time_column_is_refused_not_averaged() {
+        for bad in [
+            vec![0.0, 1.0, 0.5, 2.0],          // non-monotonic interior, positive span
+            vec![0.0, 0.0, 1.0],               // duplicate timestamps
+            vec![1.0, 0.0],                    // descending
+            vec![0.0, f64::NAN, 1.0],          // NaN interior, span still finite
+            vec![0.0, 0.0],                    // zero span
+        ] {
+            let n = bad.len();
+            assert!(mean_frame_period(&frames(&bad)).is_err(), "{bad:?} ({n} frames) must be refused");
+        }
+        // Too short to measure an interval at all.
+        assert!(mean_frame_period(&frames(&[])).is_err());
+        assert!(mean_frame_period(&frames(&[1.0])).is_err());
+        // And the error says what was wrong, so the operator is not left guessing.
+        let e = mean_frame_period(&frames(&[0.0, 1.0, 0.5, 2.0])).unwrap_err();
+        assert!(e.contains("not strictly increasing"), "unhelpful error: {e}");
+    }
 }
 
 #[cfg(test)]
