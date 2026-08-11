@@ -28,7 +28,7 @@
 //! Without `--modforms`, every peptide gets one *unmodified* modform at fraction 1.0. The unmodified
 //! form is a modform like any other, so the schema and the chain are the same either way.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use arrow::array::{
     ArrayRef, Float32Array, Float32Builder, Float64Array, ListBuilder, UInt64Array, UInt8Array,
 };
@@ -68,6 +68,16 @@ struct Args {
     charged_probability: f64,
     #[arg(long, default_value_t = 4)]
     max_charge: u8,
+    /// Drop charge states below this share of a modform's charged mass (v1's `min_charge_contrib`).
+    ///
+    /// `0` (the DEFAULT) keeps every state with a non-zero fraction, which is what v2 has always
+    /// done. v1's own default is 0.005; its reference dia-PASEF config uses **0.25**, keeping only
+    /// states with a quarter or more of the ionised mass.
+    ///
+    /// This matters more than its size suggests: without it v2 renders 5.2% of its ion signal as 1+
+    /// where v1 renders 0.0%, and it changes how many precursors reach the file at all.
+    #[arg(long, default_value_t = 0.0)]
+    min_charge_contrib: f64,
     /// Isotope peaks to keep, starting at the monoisotopic.
     #[arg(long, default_value_t = 6)]
     isotope_depth: usize,
@@ -90,6 +100,38 @@ struct Args {
     schema: bool,
     #[arg(long)]
     explain: bool,
+}
+
+/// Drop charge states carrying less than `min_contrib` of a modform's CHARGED mass — v1's
+/// `min_charge_contrib` (`imspy-predictors/.../ionization/predictors.py:127`).
+///
+/// v2 kept every state with a fraction above zero, which is defensible on its own terms but is not
+/// what an instrument records: a charge state carrying 2% of a peptide's ions is generally below the
+/// noise, and v1's reference config sets this to 0.25 — keeping only states with a quarter or more
+/// of the ionised mass, typically one or two per peptide.
+///
+/// Measured consequence of NOT having it: v2 renders 5.2% of its ion signal as 1+ where v1 renders
+/// 0.0%, because a 1+ state that a multi-site peptide gives a few percent of its mass survives in v2
+/// and is suppressed in v1.
+///
+/// The share is taken over the states that SURVIVED the charge cap, matching v1, which applies this
+/// after its own normalisation. Deliberately does NOT renormalise afterwards: v2's convention is that
+/// discarded mass stays discarded and is reported, rather than being redistributed into the
+/// survivors and inflating them (see `distribution_with_loss`).
+fn suppress_minor_charges(
+    ps: Vec<timsim_chem::Precursor>,
+    min_contrib: f64,
+) -> Vec<timsim_chem::Precursor> {
+    if min_contrib <= 0.0 {
+        return ps;
+    }
+    let total: f64 = ps.iter().map(|p| p.charge_fraction as f64).sum();
+    if !(total > 0.0) {
+        return ps;
+    }
+    ps.into_iter()
+        .filter(|p| p.charge_fraction as f64 / total >= min_contrib)
+        .collect()
 }
 
 fn main() -> Result<()> {
@@ -231,6 +273,13 @@ fn main() -> Result<()> {
         }
     }
     let use_modforms = !modforms.is_empty();
+    if !(a.min_charge_contrib.is_finite() && (0.0..1.0).contains(&a.min_charge_contrib)) {
+        return Err(anyhow!(
+            "--min-charge-contrib must be in [0, 1) (0 = keep every state; v1's reference config uses 0.25), got {}",
+            a.min_charge_contrib
+        ));
+    }
+    let min_contrib = a.min_charge_contrib;
 
     let t = std::time::Instant::now();
     let per_peptide: Vec<Vec<timsim_chem::Precursor>> = input
@@ -272,7 +321,7 @@ fn main() -> Result<()> {
                 if let Ok(ps) =
                     io.precursors_of_modform(*id, *mid, seq, comp, *delta, *frac)
                 {
-                    out.extend(ps);
+                    out.extend(suppress_minor_charges(ps, min_contrib));
                 }
             }
             out
