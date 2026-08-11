@@ -233,7 +233,11 @@ struct Args {
     /// carry their own shot noise. `off` (default) = byte-identical deterministic render.
     #[arg(long)]
     ion_count_noise: bool,
-    /// Instrument fluctuation, as a COEFFICIENT OF VARIATION per frame and per scan. `0` = off.
+    /// Instrument fluctuation, as the TOTAL per-bin COEFFICIENT OF VARIATION. `0` = off.
+    ///
+    /// A bin sees the product of a per-frame and a per-scan factor, so the two components are each
+    /// drawn at `sqrt(sqrt(1+cv^2)-1)` — passing `cv` to both would deliver `cv*sqrt(2+cv^2)`, i.e.
+    /// 1.42x the request at 0.1.
     ///
     /// v2's form of v1's `noise_frame_abundance` / `noise_scan_abundance`. Multiplicative and
     /// intensity-INDEPENDENT, so unlike `--ion-count-noise` it roughens a BRIGHT peak's trace too —
@@ -707,7 +711,8 @@ fn main() -> Result<()> {
                   a.target_p, n, a.n_sigma, (n / a.n_sigma - 1.0) * 100.0);
         a.n_sigma = n;
     }
-    for (name, v) in [("--run-rt-sd", a.run_rt_sd), ("--run-im-sd", a.run_im_sd), ("--run-intensity-cv", a.run_intensity_cv)] {
+    for (name, v) in [("--run-rt-sd", a.run_rt_sd), ("--run-im-sd", a.run_im_sd),
+                      ("--run-intensity-cv", a.run_intensity_cv), ("--instrument-cv", a.instrument_cv)] {
         if !(v.is_finite() && v >= 0.0) {
             return Err(anyhow!("{name} must be finite and >= 0 (0 = off), got {v}"));
         }
@@ -1193,17 +1198,26 @@ fn dedup_and_quantise_into(
         // too — which real data shows and Poisson alone cannot produce.
         let inst = match inst_jitter {
             Some((frame, cv, seed)) if cv > 0.0 => {
-                let g = |k: u64| {
-                    let z = splitmix64(splitmix64(seed ^ 0x51ED_2701) ^ k);
+                // DOMAIN-SEPARATED, INJECTIVE keys. The first version was
+                // `f(frame) * f((frame << 20) ^ scan ^ CONST)`, whose key spaces overlap: (0,0) and
+                // (1, 1<<20) collide, and a (frame, scan) pair can collide with a bare frame key.
+                // Correlated "noise" is worse than none — it looks random while carrying a pattern.
+                let g = |tag: u64, k: u64| {
+                    let z = splitmix64(splitmix64(seed ^ tag) ^ k);
                     let u1 = to01(splitmix64(z)).max(1e-12);
                     let u2 = to01(splitmix64(z ^ 0xD1B5_4A32_D192_ED03));
                     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
                 };
-                // Lognormal, unit mean: a multiplicative factor must not bias the ion current, and an
-                // additive one would drive low bins negative.
-                let s2 = (1.0 + cv * cv).ln();
-                let f = |k: u64| (g(k) * s2.sqrt() - 0.5 * s2).exp();
-                f(frame as u64) * f(((frame as u64) << 20) ^ (scan as u64) ^ 0x9E37_79B9)
+                // `cv` is the TOTAL per-bin coefficient of variation the caller asked for. The bin
+                // sees the PRODUCT of a frame factor and a scan factor, and two independent
+                // lognormals of CV c multiply to CV = c*sqrt(2+c^2) — so passing `cv` to each
+                // component would deliver 1.42x the request at cv=0.1. Invert it instead:
+                //     c_component = sqrt(sqrt(1 + cv^2) - 1)
+                let c = ((1.0 + cv * cv).sqrt() - 1.0).max(0.0).sqrt();
+                let s2 = (1.0 + c * c).ln();
+                let f = |tag: u64, k: u64| (g(tag, k) * s2.sqrt() - 0.5 * s2).exp();
+                f(0xF00D_0001, frame as u64)
+                    * f(0xF00D_0002, ((frame as u64) << 32) | scan as u64)
             }
             _ => 1.0,
         };
@@ -2967,8 +2981,60 @@ mod noise_tests {
         }
         // The specific pair the reviewer named must differ.
         assert_ne!(key(1, 0, 7), key(2, 256, 7));
-        // And the draws they produce must differ too.
-        assert_ne!(super::poisson_draw(5.0, key(1, 0, 7), 1), super::poisson_draw(5.0, key(2, 256, 7), 1));
+        // NOT asserted: that two Poisson draws from these keys differ. Two independent draws can
+        // legitimately return the same count, so that would be a flaky test of a property the key
+        // check already establishes.
+    }
+
+    /// The instrument factor must deliver the CV the caller ASKED for, at the bin.
+    ///
+    /// A bin sees a per-frame factor times a per-scan factor. Two independent lognormals of CV `c`
+    /// multiply to `c*sqrt(2+c^2)`, so feeding the requested CV to both components over-delivers by
+    /// 1.42x at 0.1. This pins the inversion — and that the factor stays unbiased, since a
+    /// multiplicative term with mean != 1 would silently rescale the whole run's ion current.
+    #[test]
+    fn instrument_factor_delivers_the_requested_bin_cv() {
+        for &cv in &[0.05f64, 0.10, 0.20] {
+            let c = ((1.0 + cv * cv).sqrt() - 1.0).max(0.0).sqrt();
+            let s2 = (1.0f64 + c * c).ln();
+            let g = |tag: u64, k: u64| {
+                let z = super::splitmix64(super::splitmix64(7u64 ^ tag) ^ k);
+                let u1 = super::to01(super::splitmix64(z)).max(1e-12);
+                let u2 = super::to01(super::splitmix64(z ^ 0xD1B5_4A32_D192_ED03));
+                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+            };
+            let f = |tag: u64, k: u64| (g(tag, k) * s2.sqrt() - 0.5 * s2).exp();
+            let (mut s, mut s2a, mut n) = (0f64, 0f64, 0u32);
+            for frame in 0..300u32 {
+                for scan in 0..60u32 {
+                    let v = f(0xF00D_0001, frame as u64)
+                        * f(0xF00D_0002, ((frame as u64) << 32) | scan as u64);
+                    s += v; s2a += v * v; n += 1;
+                }
+            }
+            let m = s / n as f64;
+            let got = ((s2a / n as f64 - m * m).sqrt()) / m;
+            assert!((m - 1.0).abs() < 0.02, "cv={cv}: factor mean {m}, must be ~1 (unbiased)");
+            assert!((got - cv).abs() < 0.02, "cv={cv}: delivered {got}, requested {cv}");
+        }
+    }
+
+    /// Frame and scan key spaces must not overlap — the first version's did.
+    #[test]
+    fn instrument_keys_are_domain_separated() {
+        let fk = |frame: u32| (0xF00D_0001u64, frame as u64);
+        let sk = |frame: u32, scan: u32| (0xF00D_0002u64, ((frame as u64) << 32) | scan as u64);
+        // The pair the reviewer named: (0,0) vs (1, 1<<20) collided under the old packing.
+        assert_ne!(sk(0, 0), sk(1, 1 << 20));
+        // A scan key can never equal a frame key: different domain tags.
+        assert_ne!(fk(0).0, sk(0, 0).0);
+        // And the packing is injective over a realistic grid.
+        let mut seen = std::collections::HashSet::new();
+        for frame in 0..200u32 {
+            for scan in 0..200u32 {
+                assert!(seen.insert(sk(frame, scan)), "collision at {frame},{scan}");
+            }
+        }
     }
 
     #[test]
