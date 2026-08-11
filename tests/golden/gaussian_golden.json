@@ -16,7 +16,9 @@
     "",
     "Regenerate: tests/golden/regenerate.sh (see that script for the parent-build procedure).",
     "Fixture paths are machine-local; the test SKIPS (loudly) a case whose inputs are absent, and",
-    "FAILS if that leaves nothing to check."
+    "FAILS if that leaves nothing to check.",
+    "",
+    "Cases pin BOTH --peak-shape gaussian AND --mobility-std-target 0: the first turns off the per-peptide elution shape, the second the per-ion mobility width. Both are needed to reproduce the pre-EMG binary, because per-ion mobility changes the rendered SIGNAL (analysis.tdf_bin), not just metadata -- the only change in this line of work that does."
   ],
   "parent_commit": "52e6c91",
   "head_flag": "--peak-shape gaussian",
@@ -58,7 +60,9 @@
         "--truth",
         "{out}/truth.parquet",
         "--peak-shape",
-        "gaussian"
+        "gaussian",
+        "--mobility-std-target",
+        "0"
       ],
       "needs": [
         "precursors",
@@ -137,7 +141,9 @@
         "--dda-truth",
         "{out}/dda_truth.parquet",
         "--peak-shape",
-        "gaussian"
+        "gaussian",
+        "--mobility-std-target",
+        "0"
       ],
       "needs": [
         "precursors",

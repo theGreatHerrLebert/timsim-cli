@@ -81,8 +81,29 @@ struct Args {
     n_scans: u32,
     #[arg(long, default_value_t = 30.0)]
     sigma_frames: f64,
+    /// Mobility peak width in scans, for ions the CCS model reports no uncertainty for.
+    ///
+    /// This used to apply to EVERY ion. It is now only the fallback: per-ion widths come from
+    /// `ccs_std` in `precursor_ccs`, which timsim-ccs has always produced and the render discarded.
     #[arg(long, default_value_t = 4.0)]
     sigma_scans: f64,
+    /// Target POPULATION MEAN of the per-ion mobility width, in 1/K0.
+    ///
+    /// v1's `inverse_mobility_std_mean` (default 0.009). The CCS model's raw predicted uncertainty
+    /// is ~2% wider than this, so it is scaled by a FIXED gain (target / a stamped model reference),
+    /// keeping the per-ion shape.
+    ///
+    /// v1 instead recomputes the gain per run from that run's own ion population, which makes an
+    /// ion's width depend on which other ions are present -- measured at up to 4.1% swing across
+    /// subsets. v2 does not reproduce that; see `CCS_STD_MODEL_REFERENCE`.
+    ///
+    /// `0` DISABLES per-ion widths entirely and puts every ion on the flat `--sigma-scans`, which is
+    /// what this render did before `ccs_std` was wired in. That escape hatch exists because per-ion
+    /// mobility changes the rendered SIGNAL -- the first thing in this line of work that does -- so
+    /// `--peak-shape gaussian --mobility-std-target 0` is what reproduces the pre-EMG binary
+    /// bit-for-bit, and the golden pins exactly that.
+    #[arg(long, default_value_t = timsim_cli::render::V1_MOBILITY_STD_TARGET)]
+    mobility_std_target: f64,
     #[arg(long, default_value_t = 3.0)]
     n_sigma: f64,
     /// Chromatographic peak shape for the ELUTION axis.
@@ -296,6 +317,10 @@ struct Placement {
     ref_cycle_seconds: Option<Result<f64, String>>,
     to_tof: Box<dyn Fn(f64) -> u32>,
     to_scan: Box<dyn Fn(f64) -> u32>,
+    /// scan -> `1/K0`, the inverse of [`Self::to_scan`]. Needed because the map is NONLINEAR, so a
+    /// per-ion width in `1/K0` becomes a different number of SCANS depending where on the ramp the
+    /// ion sits; the local slope is read off this rather than assumed constant.
+    to_k0: Box<dyn Fn(u32) -> f64>,
     to_mz: Box<dyn Fn(u32) -> f64>,
 }
 
@@ -369,6 +394,12 @@ fn build_placement(a: &Args) -> Result<Placement> {
                 tc_row.c0, tc_row.c1, tc_row.c2, tc_row.c3, tc_row.c4,
                 tc_row.c5, tc_row.c6, tc_row.c7, tc_row.c8, tc_row.c9,
             );
+            // A second instance for the inverse direction: the first is moved into `to_scan`, and
+            // both must come from the SAME coefficients or the forward and reverse maps disagree.
+            let mob_inv = MobilityCalibrator::new(
+                tc_row.c0, tc_row.c1, tc_row.c2, tc_row.c3, tc_row.c4,
+                tc_row.c5, tc_row.c6, tc_row.c7, tc_row.c8, tc_row.c9,
+            );
 
             eprintln!(
                 "  reference .d: {}  (num_scans {}, tof_max {}, m/z {:.0}-{:.0}, 1/K0 {:.2}-{:.2})",
@@ -387,6 +418,7 @@ fn build_placement(a: &Args) -> Result<Placement> {
                 ref_cycle_seconds: Some(mean_frame_period(&frames)),
                 to_tof: Box::new(move |m| mz_for_tof.mz_to_tof(m)),
                 to_scan: Box::new(move |k0| mob.one_over_k0_to_scan(k0)),
+                to_k0: Box::new(move |s| mob_inv.scan_to_one_over_k0(s)),
                 to_mz: Box::new(move |tof| mz.tof_to_mz(tof)),
             })
         }
@@ -409,6 +441,7 @@ fn build_placement(a: &Args) -> Result<Placement> {
                 // tof = (sqrt(mz) - tof_intercept) / tof_slope ; scan = (1/K0 - scan_intercept) / scan_slope
                 to_tof: Box::new(move |m| ((m.sqrt() - tof_intercept) / tof_slope).max(0.0) as u32),
                 to_scan: Box::new(move |k0| ((k0 - scan_intercept) / scan_slope).max(0.0) as u32),
+                to_k0: Box::new(move |s| scan_intercept + scan_slope * s as f64),
                 to_mz: Box::new(move |tof| {
                     let c = SimpleIndexConverter {
                         tof_intercept,
@@ -593,6 +626,28 @@ fn main() -> Result<()> {
             p.ref_n_frames.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()), a.n_frames
         ));
     }
+    let mob = MobilityWidth {
+        // 0 means "no per-ion widths": `mobility_sigma_scans` rejects a non-positive target, so every
+        // ion falls through to the flat fallback without a second code path to keep in step.
+        target: a.mobility_std_target,
+        reference: timsim_cli::render::CCS_STD_MODEL_REFERENCE,
+        fallback_sigma_scans: a.sigma_scans,
+    };
+    if !(a.mobility_std_target.is_finite() && a.mobility_std_target >= 0.0) {
+        return Err(anyhow!("--mobility-std-target must be finite and >= 0 (0 disables per-ion widths), got {}", a.mobility_std_target));
+    }
+    if a.mobility_std_target > 0.0 {
+        eprintln!(
+            "  mobility = per-ion ccs_std, target {:.5} 1/K0 (gain {:.4} vs model reference {:.6}); \
+             fallback {:.2} scans where the model gives none",
+            a.mobility_std_target,
+            a.mobility_std_target / timsim_cli::render::CCS_STD_MODEL_REFERENCE,
+            timsim_cli::render::CCS_STD_MODEL_REFERENCE,
+            a.sigma_scans,
+        );
+    } else {
+        eprintln!("  mobility = flat {:.2} scans for every ion (--mobility-std-target 0)", a.sigma_scans);
+    }
     let g = Geometry {
         n_frames: a.n_frames,
         n_scans: p.n_scans,
@@ -727,10 +782,10 @@ fn main() -> Result<()> {
     let span = (hi - lo).max(1e-9);
 
     if a.dda {
-        return run_dda(&a, &p, &g, &rt, lo, span, &prov);
+        return run_dda(&a, &p, &g, &rt, lo, span, &prov, &mob);
     }
     if a.dia {
-        return run_dia(&a, &p, &g, &rt, lo, span, &prov);
+        return run_dia(&a, &p, &g, &rt, lo, span, &prov, &mob);
     }
 
     // ── project: place each ion's materialised MS1 spectrum onto the grid ──────
@@ -775,7 +830,7 @@ fn main() -> Result<()> {
             // Map the index range onto the LAST valid 0-based frame (n_frames - 1); scaling by n_frames
             // puts index_max one frame past the end (and disagrees with the DIA path).
             let apex_frame = (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
-            let scan = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, &p);
+            let (scan, sigma_scans) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, &p, &mob);
 
             let peaks: Vec<(u32, f32)> = spec
                 .iter()
@@ -795,7 +850,7 @@ fn main() -> Result<()> {
             }
             let amount = amounts.get(&pid.value(i)).copied().unwrap_or(1.0);
             let abundance = amount * ionz.value(i) as f64 * mff.value(i) as f64 * frac.value(i) as f64;
-            ions.push(Ion { apex_frame, scan_center: scan as f64, abundance, peaks, elution });
+            ions.push(Ion { apex_frame, scan_center: scan, abundance, peaks, elution, sigma_scans });
             if a.limit > 0 && ions.len() >= a.limit {
                 break 'outer;
             }
@@ -1220,14 +1275,20 @@ const TEMP: f64 = 31.85;
 const T_DIFF: f64 = 273.15;
 
 /// `precursor_id -> CCS` (Å²), or an empty map if no artifact is given.
-fn load_ccs(path: &Option<PathBuf>) -> Result<HashMap<u64, f64>> {
+fn load_ccs(path: &Option<PathBuf>) -> Result<HashMap<u64, (f64, Option<f64>)>> {
     let mut out = HashMap::new();
     let Some(path) = path else { return Ok(out) };
     for b in timsim_schema::read(path, CCS::TABLE)? {
         let pcid: &UInt64Array = b.column_by_name(CCS::PRECURSOR_ID).unwrap().as_any().downcast_ref().unwrap();
         let ccs: &Float64Array = b.column_by_name(CCS::CCS).unwrap().as_any().downcast_ref().unwrap();
+        // `ccs_std` is the model's PER-ION predicted uncertainty, and it was being dropped here: the
+        // column was produced by timsim-ccs, written, schema'd, and then discarded at load, leaving
+        // every ion on one flat `--sigma-scans`. It is nullable by schema (the model may report no
+        // uncertainty), so absence is normal and falls back rather than failing.
+        let std = b.column_by_name(CCS::CCS_STD).and_then(|c| c.as_any().downcast_ref::<Float64Array>());
         for i in 0..b.num_rows() {
-            out.insert(pcid.value(i), ccs.value(i));
+            let sd = std.and_then(|s| Array::is_valid(s, i).then(|| s.value(i)));
+            out.insert(pcid.value(i), (ccs.value(i), sd));
         }
     }
     Ok(out)
@@ -1323,15 +1384,48 @@ fn uniform_unit(pc: u64, is_frag: bool, k: usize, seed: u64) -> f64 {
 /// The mobility scan for a precursor: physical CCS→1/K0 (Mason-Schamp) when its CCS is known, else a
 /// non-physical m/z trend. The 1/K0 is clamped to the acquisition band, then mapped to a scan by the
 /// run's mobility calibration.
-fn place_scan(pcid: u64, mz: f64, charge: u32, ccs: &HashMap<u64, f64>, p: &Placement) -> f64 {
-    let one_over_k0 = match ccs.get(&pcid) {
-        Some(&c) => ccs_to_one_over_reduced_mobility(c, mz, charge, MASS_GAS, TEMP, T_DIFF),
+fn place_scan(
+    pcid: u64,
+    mz: f64,
+    charge: u32,
+    ccs: &HashMap<u64, (f64, Option<f64>)>,
+    p: &Placement,
+    mob: &MobilityWidth,
+) -> (f64, f64) {
+    let entry = ccs.get(&pcid);
+    let one_over_k0 = match entry {
+        Some(&(c, _)) => ccs_to_one_over_reduced_mobility(c, mz, charge, MASS_GAS, TEMP, T_DIFF),
         None => {
             let f = ((mz - p.mz_min) / (p.mz_max - p.mz_min)).clamp(0.0, 1.0);
             p.im_min + (p.im_max - p.im_min) * f
         }
     };
-    (p.to_scan)(one_over_k0.clamp(p.im_min, p.im_max)).min(p.n_scans - 1) as f64
+    let scan = (p.to_scan)(one_over_k0.clamp(p.im_min, p.im_max)).min(p.n_scans - 1);
+    // The scan<->1/K0 map is NONLINEAR (Bruker ModelType-2), so a width in 1/K0 is a different
+    // number of scans at each end of the ramp. Take the local slope from the calibration itself,
+    // one scan either side of where this ion actually lands.
+    let sigma = entry
+        .and_then(|&(c, sd)| sd.map(|sd| (c, sd)))
+        .and_then(|(c, sd)| {
+            let lo = scan.saturating_sub(1).min(p.n_scans - 1);
+            let hi = (scan + 1).min(p.n_scans - 1);
+            if hi == lo {
+                return None;
+            }
+            let slope = ((p.to_k0)(hi) - (p.to_k0)(lo)) / (hi - lo) as f64;
+            timsim_cli::render::mobility_sigma_scans(c, sd, one_over_k0, slope, mob.target, mob.reference)
+        })
+        .unwrap_or(mob.fallback_sigma_scans);
+    (scan as f64, sigma)
+}
+
+/// How this run turns the CCS model's per-ion uncertainty into a mobility width.
+#[derive(Clone, Copy, Debug)]
+struct MobilityWidth {
+    target: f64,
+    reference: f64,
+    /// Used for ions the model gave no uncertainty for — the historical flat `--sigma-scans`.
+    fallback_sigma_scans: f64,
 }
 
 /// v1's precursor isolation-m/z metadata from the raw MS1 isotope envelope: keep isotopes above 5% of the
@@ -1350,8 +1444,11 @@ fn iso_metadata(ms1: &[(f64, f32)], precursor_mz: f64) -> (f64, f64, f64) {
 }
 
 /// Mobility (scan) window `[lo, hi]` an ion deposits across (n_sigma × sigma_scans around its apex scan).
-fn scan_window_dda(scan: i64, g: &Geometry, n_scans: u32) -> (u32, u32) {
-    let h = g.n_sigma * g.sigma_scans;
+fn scan_window_dda(scan: i64, sigma_scans: f64, g: &Geometry, n_scans: u32) -> (u32, u32) {
+    // Takes the ion's own width: see the DDA Candidate note — selection and deposition must agree
+    // about the same ion's peak, and per-ion mobility widths break that the same way per-peptide
+    // elution widths did.
+    let h = g.n_sigma * sigma_scans;
     let lo = (scan as f64 - h).max(0.0) as u32;
     let hi = ((scan as f64 + h) as u32).min(n_scans.saturating_sub(1));
     (lo, hi)
@@ -1360,7 +1457,7 @@ fn scan_window_dda(scan: i64, g: &Geometry, n_scans: u32) -> (u32, u32) {
 /// DDA-PASEF render — MS1 surveys + top-N selection (`timsim_cli::dda`) + band-limited MS2, plus a sidecar
 /// answer key tying each selection event to the true precursor. Oracle-isolation baseline: clean single
 /// target per band; in-window co-isolation contaminants (and DDA memory streaming) are follow-ups.
-fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64, prov: &timsim_cli::provenance::ElutionProvenance) -> Result<()> {
+fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64, prov: &timsim_cli::provenance::ElutionProvenance, mob: &MobilityWidth) -> Result<()> {
     use ms_io::data::tdf_writer::{DdaPasefWindow, DdaPrecursor, TdfWriter, TdfWriterConfig};
     use timsim_cli::dda::{schedule, Candidate, SelectionParams};
     use timsim_cli::render::{elution_frac, gauss_frac};
@@ -1391,7 +1488,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
         }
     }
 
-    struct DdaIon { peptide_id: u64, apex_frame: f64, scan: i64, abundance: f64, ms1: Vec<(u32, f32)>, ms2: Vec<(u32, f32)>, elution: Elution }
+    struct DdaIon { peptide_id: u64, apex_frame: f64, scan: i64, abundance: f64, ms1: Vec<(u32, f32)>, ms2: Vec<(u32, f32)>, elution: Elution, sigma_scans: f64 }
     let mut ions: HashMap<u64, DdaIon> = HashMap::new();
     let mut cands: Vec<Candidate> = Vec::new();
     let mut order: u32 = 0;
@@ -1408,7 +1505,8 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             let Some(&(rt_index, elution)) = rt.get(&pid.value(i)) else { continue };
             let Some(ms1raw) = ms1_raw.remove(&pcid.value(i)) else { continue };
             let apex_frame = 1.0 + (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
-            let scan = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p) as i64;
+            let (scan_f, sigma_scans) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p, mob);
+            let scan = scan_f as i64;
             let amount = amounts.get(&pid.value(i)).copied().unwrap_or(1.0);
             let abundance = amount * ionz.value(i) as f64 * mff.value(i) as f64 * frac.value(i) as f64;
             let (mono_mz, largest_mz, average_mz) = iso_metadata(&ms1raw, mz.value(i));
@@ -1431,7 +1529,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                     sigma_frames: elution.sigma_frames, n_sigma: g.n_sigma, shape: elution.shape,
                 });
             }
-            ions.insert(pcid.value(i), DdaIon { peptide_id: pid.value(i), apex_frame, scan, abundance, ms1, ms2, elution });
+            ions.insert(pcid.value(i), DdaIon { peptide_id: pid.value(i), apex_frame, scan, abundance, ms1, ms2, elution, sigma_scans });
             order += 1;
             if a.limit > 0 && ions.len() >= a.limit { break 'outer; }
         }
@@ -1518,9 +1616,9 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                         let io = &ions[&win[i].2];
                         let ew = io.elution.frac(f - 0.5, f + 0.5, io.apex_frame);
                         if ew <= 0.0 { continue; }
-                        let (slo, shi) = scan_window_dda(io.scan, g, n_scans);
+                        let (slo, shi) = scan_window_dda(io.scan, io.sigma_scans, g, n_scans);
                         for scan in slo..=shi {
-                            let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, io.scan as f64, g.sigma_scans);
+                            let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, io.scan as f64, io.sigma_scans);
                             if mw <= 0.0 { continue; }
                             let base = io.abundance * ew * mw;
                             for &(tof, iv) in &io.ms1 { tri.push((scan, tof, base * iv as f64)); }
@@ -1534,7 +1632,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                         let s0 = e.scan_begin.max(0) as u32;
                         let s1 = (e.scan_end.min(n_scans as i64 - 1)).max(0) as u32;
                         for scan in s0..=s1 {
-                            let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, io.scan as f64, g.sigma_scans);
+                            let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, io.scan as f64, io.sigma_scans);
                             if mw <= 0.0 { continue; }
                             let base = io.abundance * ew * mw;
                             for &(tof, iv) in &io.ms2 { tri.push((scan, tof, base * iv as f64)); }
@@ -1634,7 +1732,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
 }
 
 /// DIA render: MS1+MS2 frames on the reference's cycle, fragments gated by the diagonal transmission.
-fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64, prov: &timsim_cli::provenance::ElutionProvenance) -> Result<()> {
+fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64, prov: &timsim_cli::provenance::ElutionProvenance, mob: &MobilityWidth) -> Result<()> {
     use timsim_cli::dia::DiaSchedule;
     use timsim_cli::ms2::{active_frames, dia_render_range, DiaIon};
 
@@ -1734,6 +1832,8 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
         charge: i64,
         /// THIS ion's chromatographic peak — see [`timsim_cli::render::Ion::elution`].
         elution: Elution,
+        /// THIS ion's mobility width — see [`timsim_cli::render::Ion::sigma_scans`].
+        sigma_scans: f64,
     }
     let mut meta: HashMap<u64, IonMeta> = HashMap::new();
     let mut order: u32 = 0;
@@ -1750,7 +1850,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             let Some(&(rt_index, elution)) = rt.get(&pid.value(i)) else { continue };
             // 1-based apex frame (the DIA schedule + Frames.Id are 1-based).
             let apex_frame = 1.0 + (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
-            let scan = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p);
+            let (scan, sigma_scans) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p, mob);
             // v1's `events`: amount_amol (per sample) × ionisation propensity × modform fraction ×
             // charge fraction. amount 1.0 when no quantities given (propensities-only fallback).
             let amount = amounts.get(&pid.value(i)).copied().unwrap_or(1.0);
@@ -1764,7 +1864,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 pcid.value(i),
                 IonMeta {
                     apex_frame, scan, abundance, precursor_mz: mz.value(i), survival, order,
-                    peptide_id: pid.value(i), charge: chg.value(i).max(1) as i64, elution,
+                    peptide_id: pid.value(i), charge: chg.value(i).max(1) as i64, elution, sigma_scans,
                 },
             );
             order += 1;
@@ -1890,7 +1990,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             Some((m.order, DiaIon {
                 apex_frame: m.apex_frame, scan_center: m.scan, abundance: m.abundance,
                 precursor_mz: m.precursor_mz, ms1_peaks: m1, ms2_peaks: m2, survival: m.survival,
-                elution: m.elution,
+                elution: m.elution, sigma_scans: m.sigma_scans,
             }))
         }).collect();
         ions.sort_unstable_by_key(|x| x.0);
@@ -2026,6 +2126,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                         ms2_peaks: ms2p,
                         survival: m.survival,
                         elution: m.elution,
+                        sigma_scans: m.sigma_scans,
                     },
                 ))
             })

@@ -450,6 +450,9 @@ fn main() -> Result<()> {
                 // per-peptide widths would make the active-set size vary between ions and turn a
                 // throughput number into a function of the draw. Held constant deliberately.
                 elution: timsim_cli::render::Elution::global(g.sigma_frames, g.shape),
+                // Constant for the same reason as `elution`: this measures throughput, and a
+                // per-ion width would make the active-set size a function of the draw.
+                sigma_scans: g.sigma_scans,
             });
             if a.limit > 0 && ions.len() >= a.limit {
                 break 'outer;

@@ -170,6 +170,73 @@ pub const V1_DEFAULT_EMG_K: f64 = 10.0 / 21.0;
 /// per-peptide draw to read.
 pub const V1_K_UPPER: f64 = 10.0;
 
+/// v1's target for the POPULATION MEAN of the per-ion mobility width, in `1/K0`.
+///
+/// `inverse_mobility_std_mean = 0.009` (`simulator.py:428-429`), what v1 rescales the deep model's
+/// predicted CCS uncertainty to. On the benchmark reference's ~0.00108 `1/K0` per scan that is
+/// ≈ 8.3 scans — against the flat `--sigma-scans 4.0` v2 used before per-ion widths existed, i.e.
+/// v2's mobility peaks were roughly half as wide as v1's AND all identical.
+pub const V1_MOBILITY_STD_TARGET: f64 = 0.009;
+
+/// The CCS model's own mean predicted width, in `1/K0` — the denominator of the calibration gain.
+///
+/// v1 computes this PER RUN (`mean(k0_std)` over whatever ions are present) and scales to
+/// [`V1_MOBILITY_STD_TARGET`]. **v2 deliberately does not.** That makes an ion's width depend on
+/// which OTHER ions are in the run: measured on the 12,228-precursor benchmark set, the implied gain
+/// swings 1.4% across half-samples, 3.2% across tenths and 4.1% across fiftieths. It is the same
+/// draw-set coupling v2 designed out of its abundance and RT draws, and re-importing it to match v1
+/// would trade a real property for a cosmetic one.
+///
+/// So the gain is a CONSTANT, calibrated once. `0.009197` is the mean of `ccs_std -> 1/K0` over
+/// those 12,228 precursors, giving `0.009/0.009197 = 0.9786` — the model is ~2% too wide, not the
+/// dramatic miscalibration v1's own comment implies ("its ABSOLUTE scale is miscalibrated —
+/// systematically too wide").
+///
+/// **Tied to a specific CCS model; must be re-derived if that model is retrained.** Stamped into the
+/// artifact for exactly that reason.
+pub const CCS_STD_MODEL_REFERENCE: f64 = 0.009197;
+
+/// Per-ion mobility width in SCANS, from the model's per-ion CCS uncertainty.
+///
+/// Three steps, each a place the units can silently go wrong:
+///
+/// 1. **Å² -> `1/K0`.** Mason–Schamp is linear through the origin in CCS, so a sigma converts by the
+///    same factor as the mean and the entire constant cancels: `sigma_k0 = k0 * ccs_std / ccs`. No
+///    gas mass, no temperature, no charge — all already inside `k0`.
+/// 2. **Calibrate**, keeping the model's per-ion SHAPE. Worth keeping: decomposing the relative
+///    width on the benchmark set, charge explains only 49.9% of its variance, so half is genuine
+///    per-peptide information that a flat CV would throw away (and 4+ ions really are ~2x wider
+///    than 2+).
+/// 3. **`1/K0` -> scans**, via a LOCAL slope. Not a constant factor: the Bruker ModelType-2 map is
+///    nonlinear, so one width in `1/K0` is a different number of scans at each end of the ramp.
+///
+/// `local_k0_per_scan` is `|d(1/K0)/dscan|` at the ion's own scan. `None` when the ion has no usable
+/// predicted uncertainty, leaving the caller on the run-wide `--sigma-scans`.
+pub fn mobility_sigma_scans(
+    ccs: f64,
+    ccs_std: f64,
+    one_over_k0: f64,
+    local_k0_per_scan: f64,
+    target: f64,
+    reference: f64,
+) -> Option<f64> {
+    if !(ccs.is_finite() && ccs > 0.0 && ccs_std.is_finite() && ccs_std > 0.0) {
+        return None;
+    }
+    if !(one_over_k0.is_finite() && one_over_k0 > 0.0) {
+        return None;
+    }
+    if !(local_k0_per_scan.is_finite() && local_k0_per_scan.abs() > 0.0) {
+        return None;
+    }
+    if !(reference.is_finite() && reference > 0.0 && target.is_finite() && target > 0.0) {
+        return None;
+    }
+    let sigma_k0 = one_over_k0 * (ccs_std / ccs) * (target / reference);
+    let s = sigma_k0 / local_k0_per_scan.abs();
+    (s.is_finite() && s > 0.0).then_some(s)
+}
+
 /// v1's gradient-derived elution-width band, in SECONDS.
 ///
 /// ```text
@@ -741,6 +808,13 @@ pub struct Ion {
     /// profile: a materially easier and less realistic problem for a search engine than v1 poses.
     /// Ions of the same peptide share one value; it is built once at load, never per frame.
     pub elution: Elution,
+    /// THIS ion's mobility width in scans, from the CCS model's per-ion uncertainty.
+    ///
+    /// Separate from [`Self::elution`] because it is a different axis with a different origin: the
+    /// elution shape is a per-PEPTIDE draw, while this is a per-ION model prediction (it depends on
+    /// charge and m/z, so charge states of one peptide differ). Falls back to the run-wide
+    /// `--sigma-scans` for ions the model gave no uncertainty for.
+    pub sigma_scans: f64,
 }
 
 /// erf via Abramowitz-Stegun 7.1.26 (max error ~1.5e-7). The two renders share this, so its error
@@ -861,10 +935,10 @@ pub fn stream_render_range<F: FnMut(FrameEmission)>(
             if ew <= 0.0 {
                 continue;
             }
-            let s_lo = (io.scan_center - g.n_sigma * g.sigma_scans).max(0.0) as u32;
-            let s_hi = ((io.scan_center + g.n_sigma * g.sigma_scans) as u32).min(g.n_scans - 1);
+            let s_lo = (io.scan_center - g.n_sigma * io.sigma_scans).max(0.0) as u32;
+            let s_hi = ((io.scan_center + g.n_sigma * io.sigma_scans) as u32).min(g.n_scans - 1);
             for scan in s_lo..=s_hi {
-                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, io.scan_center, g.sigma_scans);
+                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, io.scan_center, io.sigma_scans);
                 if mw <= 0.0 {
                     continue;
                 }
@@ -944,10 +1018,10 @@ pub fn stream_render_flat_range<F: FnMut(FlatEmission)>(
             if ew <= 0.0 {
                 continue;
             }
-            let s_lo = (io.scan_center - g.n_sigma * g.sigma_scans).max(0.0) as u32;
-            let s_hi = ((io.scan_center + g.n_sigma * g.sigma_scans) as u32).min(g.n_scans - 1);
+            let s_lo = (io.scan_center - g.n_sigma * io.sigma_scans).max(0.0) as u32;
+            let s_hi = ((io.scan_center + g.n_sigma * io.sigma_scans) as u32).min(g.n_scans - 1);
             for scan in s_lo..=s_hi {
-                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, io.scan_center, g.sigma_scans);
+                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, io.scan_center, io.sigma_scans);
                 if mw <= 0.0 {
                     continue;
                 }
@@ -987,7 +1061,6 @@ pub fn sweep_render(ions: &[Ion], g: &Geometry) -> BTreeMap<(u32, u32, u32), f64
 /// sweep — never on a real run.
 pub fn reference_render(ions: &[Ion], g: &Geometry) -> BTreeMap<(u32, u32, u32), f64> {
     let mut out: BTreeMap<(u32, u32, u32), f64> = BTreeMap::new();
-    let shalf = g.n_sigma * g.sigma_scans;
     let last_frame = (g.n_frames - 1) as f64;
     let last_scan = (g.n_scans - 1) as f64;
 
@@ -999,6 +1072,7 @@ pub fn reference_render(ions: &[Ion], g: &Geometry) -> BTreeMap<(u32, u32, u32),
         // floors, where `active_window` truncates then clamps. For non-negative values the two must
         // agree, so a divergence is a real off-by-one rather than a shared mistake.
         let (fleft, fright) = elution_half_widths(io.elution.sigma_frames, g.n_sigma, &io.elution.shape);
+        let shalf = g.n_sigma * io.sigma_scans;
         let fs = (io.apex_frame - fleft).max(0.0).floor() as u32;
         let fe = (io.apex_frame + fright).min(last_frame).floor() as u32;
         let ss = (io.scan_center - shalf).max(0.0).floor() as u32;
@@ -1010,7 +1084,7 @@ pub fn reference_render(ions: &[Ion], g: &Geometry) -> BTreeMap<(u32, u32, u32),
                 continue;
             }
             for scan in ss..=se {
-                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, io.scan_center, g.sigma_scans);
+                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, io.scan_center, io.sigma_scans);
                 if mw <= 0.0 {
                     continue;
                 }
@@ -1102,14 +1176,14 @@ mod tests {
     fn fixture() -> Vec<Ion> {
         vec![
             // long-lived, mid grid, two isotope peaks
-            Ion { apex_frame: 20.0, scan_center: 15.0, abundance: 100.0, peaks: vec![(500, 1.0), (504, 0.4)], elution: Elution::global(2.5, PeakShape::Gaussian) },
+            Ion { apex_frame: 20.0, scan_center: 15.0, abundance: 100.0, peaks: vec![(500, 1.0), (504, 0.4)], elution: Elution::global(2.5, PeakShape::Gaussian), sigma_scans: 1.5 },
             // co-elutes with the next one at the SAME locus + SAME tof -> bins must add
-            Ion { apex_frame: 20.3, scan_center: 15.0, abundance: 50.0, peaks: vec![(500, 1.0)], elution: Elution::global(2.5, PeakShape::Gaussian) },
-            Ion { apex_frame: 20.1, scan_center: 15.0, abundance: 30.0, peaks: vec![(500, 1.0)], elution: Elution::global(2.5, PeakShape::Gaussian) },
+            Ion { apex_frame: 20.3, scan_center: 15.0, abundance: 50.0, peaks: vec![(500, 1.0)], elution: Elution::global(2.5, PeakShape::Gaussian), sigma_scans: 1.5 },
+            Ion { apex_frame: 20.1, scan_center: 15.0, abundance: 30.0, peaks: vec![(500, 1.0)], elution: Elution::global(2.5, PeakShape::Gaussian), sigma_scans: 1.5 },
             // scan-0 boundary (half the mobility peak is clamped away)
-            Ion { apex_frame: 8.0, scan_center: 0.4, abundance: 70.0, peaks: vec![(300, 1.0)], elution: Elution::global(2.5, PeakShape::Gaussian) },
+            Ion { apex_frame: 8.0, scan_center: 0.4, abundance: 70.0, peaks: vec![(300, 1.0)], elution: Elution::global(2.5, PeakShape::Gaussian), sigma_scans: 1.5 },
             // last-frame boundary
-            Ion { apex_frame: 39.2, scan_center: 22.0, abundance: 40.0, peaks: vec![(900, 1.0), (905, 0.2)], elution: Elution::global(2.5, PeakShape::Gaussian) },
+            Ion { apex_frame: 39.2, scan_center: 22.0, abundance: 40.0, peaks: vec![(900, 1.0), (905, 0.2)], elution: Elution::global(2.5, PeakShape::Gaussian), sigma_scans: 1.5 },
         ]
     }
 
@@ -1201,7 +1275,7 @@ mod tests {
     #[test]
     fn lone_interior_ion_conserves_analytic_mass() {
         let g = geom();
-        let ion = Ion { apex_frame: 20.0, scan_center: 15.0, abundance: 100.0, peaks: vec![(500, 1.0), (504, 0.4)], elution: Elution::global(2.5, PeakShape::Gaussian) };
+        let ion = Ion { apex_frame: 20.0, scan_center: 15.0, abundance: 100.0, peaks: vec![(500, 1.0), (504, 0.4)], elution: Elution::global(2.5, PeakShape::Gaussian), sigma_scans: 1.5 };
         let cube = sweep_render(std::slice::from_ref(&ion), &g);
         let emitted: f64 = cube.values().sum();
 
@@ -1209,11 +1283,11 @@ mod tests {
         // reading `g` here would let the test pass by coincidence and keep passing if the render
         // stopped honouring per-ion widths entirely.
         let fhalf = g.n_sigma * ion.elution.sigma_frames;
-        let shalf = g.n_sigma * g.sigma_scans;
+        let shalf = g.n_sigma * ion.sigma_scans;
         let (fs, fe) = ((ion.apex_frame - fhalf).floor() as i64, (ion.apex_frame + fhalf).floor() as i64);
         let (ss, se) = ((ion.scan_center - shalf).floor() as i64, (ion.scan_center + shalf).floor() as i64);
         let frame_mass: f64 = (fs..=fe).map(|f| gauss_frac(f as f64 - 0.5, f as f64 + 0.5, ion.apex_frame, ion.elution.sigma_frames)).sum();
-        let scan_mass: f64 = (ss..=se).map(|s| gauss_frac(s as f64 - 0.5, s as f64 + 0.5, ion.scan_center, g.sigma_scans)).sum();
+        let scan_mass: f64 = (ss..=se).map(|s| gauss_frac(s as f64 - 0.5, s as f64 + 0.5, ion.scan_center, ion.sigma_scans)).sum();
         let peak_sum: f64 = ion.peaks.iter().map(|&(_, iv)| iv as f64).sum();
         let expected = ion.abundance * frame_mass * scan_mass * peak_sum;
 
@@ -1496,6 +1570,51 @@ mod tests {
         }
         // There is no `Emg` for k = 0: that shape is a `Gaussian`.
         assert!(matches!(Emg::new(0.0, 3.0), Err(PeakShapeError::NotPositive { .. })));
+    }
+
+    /// The Å²→scan conversion, checked against numbers derived independently of the code.
+    ///
+    /// The load-bearing claim is that the Mason–Schamp constant CANCELS: because `1/K0 = C·CCS` with
+    /// `C` independent of CCS, a width converts by the same factor as the mean, so
+    /// `sigma_k0 = k0·ccs_std/ccs` needs no gas mass, temperature or charge. If that were wrong the
+    /// widths would be off by a charge- and m/z-dependent factor — plausible-looking and wrong.
+    #[test]
+    fn mobility_width_converts_through_the_cancelling_ratio() {
+        // A 2+ peptide on the benchmark reference: CCS 500 A^2 at 1/K0 = 1.0, 0.00108 1/K0 per scan.
+        let (ccs, k0, per_scan) = (500.0, 1.0, 0.00108);
+        // A 1% relative CCS uncertainty is 1% of 1/K0, i.e. 0.01 -- then the gain, then scans.
+        let s = mobility_sigma_scans(ccs, 5.0, k0, per_scan, 0.009, 0.009197).unwrap();
+        let expect = 1.0 * (5.0 / 500.0) * (0.009 / 0.009197) / 0.00108;
+        assert!((s - expect).abs() < 1e-9, "{s} != {expect}");
+        assert!((s - 9.06).abs() < 0.05, "expected ~9.1 scans for a 1% CCS sd, got {s}");
+
+        // RELATIVE, not absolute: doubling CCS and its sd at the same 1/K0 must not move the width.
+        let t = mobility_sigma_scans(1000.0, 10.0, k0, per_scan, 0.009, 0.009197).unwrap();
+        assert!((s - t).abs() < 1e-9, "width must depend on ccs_std/ccs, not on ccs: {s} vs {t}");
+
+        // The nonlinear ramp: the SAME 1/K0 width is more scans where the ramp is shallower.
+        let shallow = mobility_sigma_scans(ccs, 5.0, k0, per_scan / 2.0, 0.009, 0.009197).unwrap();
+        assert!((shallow - 2.0 * s).abs() < 1e-9, "a half-slope ramp must double the scan width");
+
+        // The gain pins the POPULATION, so an ion at the model's mean lands on the target.
+        let at_ref = mobility_sigma_scans(ccs, ccs * 0.009197 / k0, k0, per_scan, 0.009, 0.009197).unwrap();
+        assert!((at_ref * per_scan - 0.009).abs() < 1e-12, "an average ion must land on the target");
+    }
+
+    /// Garbage in must not become a plausible width.
+    #[test]
+    fn mobility_width_refuses_what_it_cannot_convert() {
+        let ok = (500.0, 5.0, 1.0, 0.00108, 0.009, 0.009197);
+        assert!(mobility_sigma_scans(ok.0, ok.1, ok.2, ok.3, ok.4, ok.5).is_some());
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            assert!(mobility_sigma_scans(bad, ok.1, ok.2, ok.3, ok.4, ok.5).is_none(), "ccs={bad}");
+            assert!(mobility_sigma_scans(ok.0, bad, ok.2, ok.3, ok.4, ok.5).is_none(), "ccs_std={bad}");
+            assert!(mobility_sigma_scans(ok.0, ok.1, bad, ok.3, ok.4, ok.5).is_none(), "k0={bad}");
+            assert!(mobility_sigma_scans(ok.0, ok.1, ok.2, ok.3, bad, ok.5).is_none(), "target={bad}");
+            assert!(mobility_sigma_scans(ok.0, ok.1, ok.2, ok.3, ok.4, bad).is_none(), "reference={bad}");
+        }
+        // A zero-slope ramp would divide by zero and hand back infinity.
+        assert!(mobility_sigma_scans(ok.0, ok.1, ok.2, 0.0, ok.4, ok.5).is_none());
     }
 
     /// v1's gradient→width law, pinned against values computed from its own formula.

@@ -42,6 +42,8 @@ pub struct DiaIon {
     pub survival: f64,
     /// THIS ion's chromatographic peak — see [`crate::render::Ion::elution`].
     pub elution: crate::render::Elution,
+    /// THIS ion's mobility width in scans — see [`crate::render::Ion::sigma_scans`].
+    pub sigma_scans: f64,
 }
 
 /// Elution frame window `[start, end]` (1-based, to match the DIA schedule / `Frames.Id`). Public so the
@@ -56,9 +58,9 @@ pub fn active_frames(apex: f64, e: &crate::render::Elution, g: &Geometry) -> (u3
     (start, end)
 }
 
-fn scan_window(scan_center: f64, g: &Geometry) -> (u32, u32) {
-    let lo = (scan_center - g.n_sigma * g.sigma_scans).max(0.0) as u32;
-    let hi = ((scan_center + g.n_sigma * g.sigma_scans) as u32).min(g.n_scans - 1);
+fn scan_window(scan_center: f64, sigma_scans: f64, g: &Geometry) -> (u32, u32) {
+    let lo = (scan_center - g.n_sigma * sigma_scans).max(0.0) as u32;
+    let hi = ((scan_center + g.n_sigma * sigma_scans) as u32).min(g.n_scans - 1);
     (lo, hi)
 }
 
@@ -80,7 +82,7 @@ pub fn ms2_render(ions: &[DiaIon], sched: &DiaSchedule, g: &Geometry) -> BTreeMa
             if ew <= 0.0 {
                 continue;
             }
-            let (s_lo, s_hi) = scan_window(ion.scan_center, g);
+            let (s_lo, s_hi) = scan_window(ion.scan_center, ion.sigma_scans, g);
             for scan in s_lo..=s_hi {
                 let t = sched
                     .transmission
@@ -88,7 +90,7 @@ pub fn ms2_render(ions: &[DiaIon], sched: &DiaSchedule, g: &Geometry) -> BTreeMa
                 if t <= EPS {
                     continue;
                 }
-                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, ion.scan_center, g.sigma_scans);
+                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, ion.scan_center, ion.sigma_scans);
                 if mw <= 0.0 {
                     continue;
                 }
@@ -146,7 +148,7 @@ pub fn ms2_reference(ions: &[DiaIon], sched: &DiaSchedule, g: &Geometry) -> BTre
             if ew <= 0.0 {
                 continue;
             }
-            let (s_lo, s_hi) = scan_window(ion.scan_center, g);
+            let (s_lo, s_hi) = scan_window(ion.scan_center, ion.sigma_scans, g);
             for scan in s_lo..=s_hi {
                 let Some(&(iso_mz, iso_w)) = wmap.get(&(group, scan)) else {
                     continue; // no window at this (group, scan) — mscore blocks it too
@@ -155,7 +157,7 @@ pub fn ms2_reference(ions: &[DiaIon], sched: &DiaSchedule, g: &Geometry) -> BTre
                 if t <= EPS {
                     continue;
                 }
-                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, ion.scan_center, g.sigma_scans);
+                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, ion.scan_center, ion.sigma_scans);
                 if mw <= 0.0 {
                     continue;
                 }
@@ -254,7 +256,7 @@ pub fn dia_render_range<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
             if ew <= 0.0 {
                 continue;
             }
-            let (s_lo, s_hi) = scan_window(ion.scan_center, g);
+            let (s_lo, s_hi) = scan_window(ion.scan_center, ion.sigma_scans, g);
             for scan in s_lo..=s_hi {
                 // MS1 frames pass everything; MS2 frames gate the precursor through the quad diagonal.
                 let t = if ms_level == 1 {
@@ -266,7 +268,7 @@ pub fn dia_render_range<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
                     }
                     tt
                 };
-                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, ion.scan_center, g.sigma_scans);
+                let mw = gauss_frac(scan as f64 - 0.5, scan as f64 + 0.5, ion.scan_center, ion.sigma_scans);
                 if mw <= 0.0 {
                     continue;
                 }
@@ -348,6 +350,7 @@ mod tests {
             ms2_peaks: vec![(300, 1.0), (450, 0.4)],
             survival: 0.0,
             elution: crate::render::Elution::global(2.5, crate::render::PeakShape::Gaussian),
+            sigma_scans: 1.5,
         }
     }
 
