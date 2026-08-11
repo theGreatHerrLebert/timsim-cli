@@ -231,7 +231,11 @@ struct Args {
     ///
     /// Applies to the SYNTHETIC signal only: A2 background is real detector counts that already
     /// carry their own shot noise. `off` (default) = byte-identical deterministic render.
-    #[arg(long)]
+    /// Takes an explicit `true`/`false` rather than being a bare flag: the DAG runner builds this
+    /// command from a template, and a conditionally-present flag has to be injected as a string
+    /// fragment — which the runner then QUOTES, producing `'--ion-count-noise '--instrument-cv` as a
+    /// single argument. A valued flag is always present and always well-formed.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     ion_count_noise: bool,
     /// Instrument fluctuation, as the TOTAL per-bin COEFFICIENT OF VARIATION. `0` = off.
     ///
