@@ -170,6 +170,43 @@ pub const V1_DEFAULT_EMG_K: f64 = 10.0 / 21.0;
 /// per-peptide draw to read.
 pub const V1_K_UPPER: f64 = 10.0;
 
+/// v1's truncation rule, expressed as v2's.
+///
+/// The two tools truncate by the same KIND of rule in different units. v1 solves for the smallest
+/// interval capturing `target_p` of the peak's mass (`target_p = 0.999`,
+/// `simulate_frame_distributions_emg.py`); v2 truncates at `n_sigma` — but v2's EMG right edge is
+/// already placed by solving `S(edge) = p` with `p = 0.5*erfc(n_sigma/sqrt2)`, so `n_sigma` IS a
+/// probability parameterisation wearing sigma's clothes. Captured mass is `1 - 2p` on both kernels.
+///
+/// Inverting that gives the exact correspondence, and it is not a rounding difference:
+///
+/// | | captured | window |
+/// |---|---|---|
+/// | v2 `n_sigma = 3.0` | 0.99730 | — |
+/// | v1 `target_p = 0.999` | 0.99900 | **9.7% wider** |
+///
+/// The mass difference is 0.17 percentage points and immaterial. The WIDTH difference is not: a 9.7%
+/// wider deposition window puts ~10% more frames under every peak, which is co-elution — the thing a
+/// DIA search has to disentangle.
+///
+/// Bisection rather than a closed form because `erfc_nr` is what the render already trusts, and this
+/// runs ONCE per render.
+pub fn n_sigma_for_target_p(target_p: f64) -> Option<f64> {
+    if !(target_p.is_finite() && target_p > 0.0 && target_p < 1.0) {
+        return None;
+    }
+    let captured = |n: f64| 1.0 - erfc_nr(n / std::f64::consts::SQRT_2);
+    let (mut lo, mut hi) = (0.0f64, 40.0f64);
+    if captured(hi) < target_p {
+        return None; // beyond f64's reach; the caller's domain guard reports it
+    }
+    for _ in 0..200 {
+        let m = 0.5 * (lo + hi);
+        if captured(m) < target_p { lo = m } else { hi = m }
+    }
+    (hi.is_finite() && hi > 0.0).then_some(hi)
+}
+
 /// v1's target for the POPULATION MEAN of the per-ion mobility width, in `1/K0`.
 ///
 /// `inverse_mobility_std_mean = 0.009` (`simulator.py:428-429`), what v1 rescales the deep model's
@@ -1615,6 +1652,31 @@ mod tests {
         }
         // A zero-slope ramp would divide by zero and hand back infinity.
         assert!(mobility_sigma_scans(ok.0, ok.1, ok.2, 0.0, ok.4, ok.5).is_none());
+    }
+
+    /// The truncation correspondence, checked in both directions.
+    #[test]
+    fn target_p_and_n_sigma_are_the_same_rule() {
+        let cap = |n: f64| 1.0 - erfc_nr(n / std::f64::consts::SQRT_2);
+        // v1's rule, in v2's units. The window is ~9.7% wider than v2's default -- ~10% more frames
+        // under every peak, which is co-elution, not a rounding difference.
+        let n = n_sigma_for_target_p(0.999).unwrap();
+        assert!((n - 3.290527).abs() < 1e-5, "target_p 0.999 -> n_sigma {n}");
+        assert!((n / 3.0 - 1.0968).abs() < 1e-3, "window ratio vs v2's default");
+        // v2's default, in v1's units.
+        assert!((cap(3.0) - 0.9973).abs() < 1e-4);
+        // Round trip across the useful range.
+        for &p in &[0.9, 0.99, 0.997, 0.999, 0.9999] {
+            let n = n_sigma_for_target_p(p).unwrap();
+            assert!((cap(n) - p).abs() < 1e-9, "round trip failed at {p}: n={n} -> {}", cap(n));
+        }
+        // Monotone: a tighter target must never give a narrower window.
+        let (a, b) = (n_sigma_for_target_p(0.99).unwrap(), n_sigma_for_target_p(0.999).unwrap());
+        assert!(b > a);
+        // Refuses what is not a probability.
+        for bad in [0.0, 1.0, -0.1, 1.5, f64::NAN, f64::INFINITY] {
+            assert!(n_sigma_for_target_p(bad).is_none(), "target_p={bad} must be refused");
+        }
     }
 
     /// v1's gradient→width law, pinned against values computed from its own formula.

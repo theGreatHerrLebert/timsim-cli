@@ -106,6 +106,18 @@ struct Args {
     mobility_std_target: f64,
     #[arg(long, default_value_t = 3.0)]
     n_sigma: f64,
+    /// Truncate each peak at the smallest window capturing this fraction of its mass — v1's rule
+    /// (`target_p`, default 0.999). `0` (the DEFAULT here) leaves `--n-sigma` in charge.
+    ///
+    /// The two are the SAME rule in different units: v2 places the EMG's right edge by solving
+    /// `S(edge) = p` with `p = 0.5*erfc(n_sigma/sqrt2)`, so captured mass is `1 - 2p` either way.
+    /// Exactly: v1's `0.999` is `n_sigma = 3.2905`, and v2's default `3.0` is `target_p = 0.9973`.
+    ///
+    /// Worth setting for a v1 comparison, because the difference is not the 0.17 pp of discarded
+    /// mass — it is that v1's window is 9.7% WIDER, putting ~10% more frames under every peak. That
+    /// is co-elution, which is the thing a DIA search exists to disentangle.
+    #[arg(long, default_value_t = 0.0)]
+    target_p: f64,
     /// Chromatographic peak shape for the ELUTION axis.
     ///
     /// `emg` (the DEFAULT) is v1's exponentially modified Gaussian: a Gaussian of width `sigma`
@@ -625,6 +637,17 @@ fn main() -> Result<()> {
             "--spike-into needs --n-frames == the real frame count ({}); got {}. Use --n-frames 0 to inherit.",
             p.ref_n_frames.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()), a.n_frames
         ));
+    }
+    // v1's truncation rule, if asked for, resolved into v2's units. Done here rather than deeper so
+    // there is ONE n_sigma from this point on and no code path can disagree about the window.
+    if a.target_p != 0.0 {
+        let n = timsim_cli::render::n_sigma_for_target_p(a.target_p).ok_or_else(|| anyhow!(
+            "--target-p must be a probability in (0, 1) reachable in f64 (v1 uses 0.999); got {}",
+            a.target_p
+        ))?;
+        eprintln!("  truncation = target_p {:.6} -> n_sigma {:.6} (was {:.4}, window {:+.1}%)",
+                  a.target_p, n, a.n_sigma, (n / a.n_sigma - 1.0) * 100.0);
+        a.n_sigma = n;
     }
     let mob = MobilityWidth {
         // 0 means "no per-ion widths": `mobility_sigma_scans` rejects a non-positive target, so every
