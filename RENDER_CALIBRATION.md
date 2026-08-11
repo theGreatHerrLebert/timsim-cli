@@ -108,7 +108,7 @@ fragments are not missing from the model; they are being censored before reachin
 
 ### What A3 (counting statistics) already recovered
 
-`--shot-noise` moves both metrics the right way while preserving TIC to +0.5%:
+`--ion-count-noise` moves both metrics the right way while preserving TIC to +0.5%:
 
 | | peaks/scan | intensity/peak |
 |---|---|---|

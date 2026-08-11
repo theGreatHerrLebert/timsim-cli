@@ -211,7 +211,12 @@ struct Args {
     /// ppm. (v1's asymmetric `right_drag` tailing variant is not ported.)
     #[arg(long, default_value_t = false)]
     noise_mz_uniform: bool,
-    /// Noise A3 — **counting statistics** on every synthetic detector bin.
+    /// Noise A3 — **ion-counting statistics** on every synthetic detector bin.
+    ///
+    /// Named `--ion-count-noise` rather than `--shot-noise` deliberately: in MS usage "shot noise"
+    /// is commonly heard as a property of the BACKGROUND, and this flag sits next to
+    /// `--noise-real-data`, which genuinely is background. This one is the counting uncertainty on
+    /// the ANALYTE's own signal.
     ///
     /// The render computes an EXPECTED count per `(scan, tof)` and, without this, writes it exactly.
     /// Real data does not: a bin expecting 25 counts returns Poisson-distributed around 25 (+/-20%
@@ -227,7 +232,7 @@ struct Args {
     /// Applies to the SYNTHETIC signal only: A2 background is real detector counts that already
     /// carry their own shot noise. `off` (default) = byte-identical deterministic render.
     #[arg(long)]
-    shot_noise: bool,
+    ion_count_noise: bool,
     /// Run-to-run RT jitter, in SECONDS (standard deviation). `0` = off.
     ///
     /// A real re-injection does not put a peptide at exactly the same retention time. v1 had this as
@@ -989,7 +994,7 @@ fn main() -> Result<()> {
             }
             next_fid += 1;
         }
-        let (scans, tofs, ints) = dedup_and_quantise(e.triples, a.intensity_scale, a.min_peak_intensity, &[], shot_for(&a, target));
+        let (scans, tofs, ints) = dedup_and_quantise(e.triples, a.intensity_scale, a.min_peak_intensity, &[], ion_count_key(&a, target));
         total_peaks += scans.len() as u64;
         if let Err(x) = write_frame(&mut writer, target, 0, a.cycle_seconds, scans, tofs, ints) {
             err = Err(x);
@@ -1119,10 +1124,10 @@ fn dedup_and_quantise(
     scale: f64,
     floor: u32,
     noise: &[(u32, u32, f64)],
-    shot: Option<(u32, u64)>,
+    ion_count: Option<(u32, u64)>,
 ) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let mut b = DedupBufs::default();
-    dedup_and_quantise_into(&mut b, triples, scale, floor, noise, shot);
+    dedup_and_quantise_into(&mut b, triples, scale, floor, noise, ion_count);
     (b.scans, b.tofs, b.ints)
 }
 
@@ -1137,7 +1142,7 @@ fn dedup_and_quantise_into(
     // `(frame, seed)` when counting statistics are on. The frame is part of the key so the same
     // `(scan, tof)` bin draws independently in each frame — otherwise one ion's whole elution profile
     // would receive a single correlated deviate and the chromatogram would be smooth-but-wrong.
-    shot: Option<(u32, u64)>,
+    ion_count: Option<(u32, u64)>,
 ) {
     debug_assert!(scale.is_finite() && scale > 0.0, "intensity_scale must be finite and > 0");
     const CEIL: f64 = u32::MAX as f64;
@@ -1162,7 +1167,7 @@ fn dedup_and_quantise_into(
         // Counting statistics apply to the SYNTHETIC signal only. The A2 background is real detector
         // counts lifted from a real file — it already carries its own shot noise, and drawing Poisson
         // over it again would inflate the background's variance without changing its mean.
-        let signal = match shot {
+        let signal = match ion_count {
             Some((frame, seed)) => poisson_draw(v * scale, splitmix64(splitmix64(frame as u64) ^ key), seed),
             None => v * scale,
         };
@@ -1526,8 +1531,8 @@ impl RunJitter {
 }
 
 /// `(frame, seed)` for the counting-statistics draw, or `None` when it is off.
-fn shot_for(a: &Args, frame: u32) -> Option<(u32, u64)> {
-    a.shot_noise.then_some((frame, a.noise_seed))
+fn ion_count_key(a: &Args, frame: u32) -> Option<(u32, u64)> {
+    a.ion_count_noise.then_some((frame, a.noise_seed))
 }
 
 #[inline]
@@ -1893,7 +1898,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                         }
                     }
                 }
-                let (scans, tofs, ints) = dedup_and_quantise(&tri, a.intensity_scale, a.min_peak_intensity, &[], shot_for(&a, frame));
+                let (scans, tofs, ints) = dedup_and_quantise(&tri, a.intensity_scale, a.min_peak_intensity, &[], ion_count_key(&a, frame));
                 if is_ms1 { c_ms1 += scans.len() as u64 } else { c_ms2 += scans.len() as u64 }
                 let blk = ms_io::data::tdf_writer::encode_frame_block(&scans, &tofs, &ints, n_scans, compression_level)
                     .map_err(|e| e.to_string())?;
@@ -2284,7 +2289,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
         // 3) Render + encode each chunk in PARALLEL. The closure is pure: reads `ions`/`sched`/`g`, calls
         //    the Sync `apply_transmission`, and emits owned EncodedBlocks. Gated memory bounds the collect.
         type ChunkOut = (Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)>, u64, u64);
-        let shot: Option<u64> = a.shot_noise.then_some(a.noise_seed);
+        let ion_count_seed: Option<u64> = a.ion_count_noise.then_some(a.noise_seed);
     let (n_scans, iscale, floor, noise_only) =
             (p.n_scans, a.intensity_scale, a.min_peak_intensity, a.noise_only);
         // With per-frame background (A2 / spike), every frame must be visited so its real peaks land even
@@ -2306,7 +2311,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 if err.is_some() { return; }
                 let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
                 let syn: &[(u32, u32, f64)] = if noise_only { &[] } else { tri };
-                dedup_and_quantise_into(&mut bufs, syn, iscale, floor, fnoise, shot.map(|sd| (frame, sd)));
+                dedup_and_quantise_into(&mut bufs, syn, iscale, floor, fnoise, ion_count_seed.map(|sd| (frame, sd)));
                 if bufs.scans.is_empty() { return; } // truly-empty frame → gap (written empty on append)
                 if ms_type == 0 { c1 += bufs.scans.len() as u64 } else { c2 += bufs.scans.len() as u64 }
                 match ms_io::data::tdf_writer::encode_frame_block(&bufs.scans, &bufs.tofs, &bufs.ints, n_scans, 1) {
@@ -2411,7 +2416,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 }
                 let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
                 let syn: &[(u32, u32, f64)] = if a.noise_only { &[] } else { tri };
-                let (scans, tofs, ints) = dedup_and_quantise(syn, a.intensity_scale, a.min_peak_intensity, fnoise, a.shot_noise.then_some((frame, a.noise_seed)));
+                let (scans, tofs, ints) = dedup_and_quantise(syn, a.intensity_scale, a.min_peak_intensity, fnoise, a.ion_count_noise.then_some((frame, a.noise_seed)));
                 if scans.is_empty() {
                     return; // truly-empty frame → leave a gap (filled empty by the next write / trailing loop)
                 }
@@ -2437,7 +2442,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             render_range_parallel(
                 &mut writer, &ions, &sched, g, fc0, fc1, emit_all, &frame_noise,
                 &ParallelRenderCfg {
-                    shot_noise_seed: a.shot_noise.then_some(a.noise_seed),
+                    ion_count_seed: a.ion_count_noise.then_some(a.noise_seed),
                     n_scans: p.n_scans,
                     intensity_scale: a.intensity_scale,
                     min_peak_intensity: a.min_peak_intensity,
@@ -2532,9 +2537,9 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
 /// The scalar render knobs `render_range_parallel` needs. Bundled because the rayon closure must NOT
 /// capture `Args`/`Placement` — `Placement` holds boxed `to_tof`/`from_tof` closures that are not `Sync`.
 struct ParallelRenderCfg {
-    /// Seed for counting statistics, or `None` when they are off. Carried on the config rather than
+    /// Seed for ion-counting statistics, or `None` when they are off. Carried on the config rather than
     /// read from `Args` because this path runs inside rayon and cannot borrow the CLI struct.
-    shot_noise_seed: Option<u64>,
+    ion_count_seed: Option<u64>,
     n_scans: u32,
     intensity_scale: f64,
     min_peak_intensity: u32,
@@ -2607,7 +2612,7 @@ fn render_range_parallel(
     };
 
     type ChunkOut = (Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)>, u64, u64);
-    let shot: Option<u64> = cfg.shot_noise_seed;
+    let ion_count_seed: Option<u64> = cfg.ion_count_seed;
     let (n_scans, iscale, floor, noise_only) =
         (cfg.n_scans, cfg.intensity_scale, cfg.min_peak_intensity, cfg.noise_only);
     // Encoded blocks are the only thing that crosses the rayon boundary, and they are held only until the
@@ -2639,7 +2644,7 @@ fn render_range_parallel(
                     }
                     let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
                     let syn: &[(u32, u32, f64)] = if noise_only { &[] } else { tri };
-                    dedup_and_quantise_into(&mut bufs, syn, iscale, floor, fnoise, shot.map(|sd| (frame, sd)));
+                    dedup_and_quantise_into(&mut bufs, syn, iscale, floor, fnoise, ion_count_seed.map(|sd| (frame, sd)));
                     if bufs.scans.is_empty() {
                         return; // truly-empty frame → leave a gap (written empty on append)
                     }
