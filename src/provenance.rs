@@ -102,7 +102,7 @@ pub const KEY_GRADIENT_SECONDS: &str = "gradient_seconds";
 pub const KEY_CYCLE_SECONDS: &str = "cycle_seconds";
 pub const KEY_SIGMA_BAND: &str = "sigma_band_seconds";
 pub const KEY_K_UPPER: &str = "k_upper";
-pub const KEY_REALIZED_DIGEST: &str = "realized_shape_digest";
+pub const KEY_REALIZED_DIGEST: &str = "shape_population_digest";
 pub const KEY_N_SHAPED: &str = "n_peptides_shaped";
 pub const KEY_N_COLLAPSED: &str = "n_gaussian_collapsed";
 pub const KEY_SIGMA_STATS: &str = "sigma_frames_min_mean_max";
@@ -256,7 +256,15 @@ impl ElutionProvenance {
 
     /// The same record in Bruker `GlobalMetadata` spelling (`Sim`-prefixed, CamelCase).
     pub fn tdf_pairs(&self) -> Vec<(String, String)> {
-        self.pairs().into_iter().map(|(k, v)| (tdf_key(&k), v)).collect()
+        let out: Vec<(String, String)> = self.pairs().into_iter().map(|(k, v)| (tdf_key(&k), v)).collect();
+        // `tdf_key` is not injective (see its docs) and the stamp is an INSERT OR REPLACE, so a
+        // collision would silently drop a field rather than fail. Cheap to check, and the failure it
+        // prevents is invisible.
+        let mut seen = std::collections::HashSet::with_capacity(out.len());
+        for (k, _) in &out {
+            assert!(seen.insert(k.clone()), "tdf provenance key collision on {k:?} — rename the offending key");
+        }
+        out
     }
 
     pub fn schema_metadata(&self) -> HashMap<String, String> {
@@ -265,6 +273,12 @@ impl ElutionProvenance {
 }
 
 /// `peak_shape` -> `SimPeakShape`. ONE mapping, so the two spellings cannot drift.
+///
+/// NOT injective in general: it drops underscores, so `a_b`, `a__b` and `_a_b` all collapse to
+/// `SimAB`. The declared keys are collision-free today, and [`ElutionProvenance::tdf_pairs`] asserts
+/// that rather than trusting it — a future key added with a doubled or leading underscore would
+/// otherwise silently overwrite another key's value in `GlobalMetadata`, where the write is an
+/// `INSERT OR REPLACE`.
 fn tdf_key(k: &str) -> String {
     let mut out = String::from("Sim");
     let mut upper = true;

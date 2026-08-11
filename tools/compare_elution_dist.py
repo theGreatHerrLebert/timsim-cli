@@ -92,9 +92,16 @@ def ks(a, b):
 
 
 def w1(a, b):
-    """Wasserstein-1 = integral |F_a - F_b|, computed on the pooled quantile grid."""
+    """Wasserstein-1 = integral_0^1 |Q_a(u) - Q_b(u)| du, by trapezoid on a uniform grid.
+
+    `mean` over an INCLUSIVE grid is not that integral -- it over-weights the endpoints by half a
+    cell each. Negligible at 2001 points, but this is an acceptance measure, so it should be the
+    quantity it claims to be rather than one that is usually close to it.
+    """
     q = np.linspace(0, 1, 2001)
-    return float(np.mean(np.abs(np.quantile(a, q) - np.quantile(b, q))))
+    # `trapezoid` is NumPy >= 2.0; `trapz` is the pre-2.0 spelling and this box has 1.x.
+    trap = getattr(np, "trapezoid", None) or np.trapz
+    return float(trap(np.abs(np.quantile(a, q) - np.quantile(b, q)), q))
 
 
 def report(name, v1, v2, mean_tol, w1_tol):
@@ -119,6 +126,30 @@ def report(name, v1, v2, mean_tol, w1_tol):
     return ok, {"n_v1": int(v1.size), "n_v2": int(v2.size), "mean_v1": float(v1.mean()),
                 "mean_v2": float(v2.mean()), "mean_rel": dmean, "w1": w, "w1_rel_iqr": w / iqr,
                 "ks_d": d, "ks_p": p, "pass": bool(ok)}
+
+
+def conforms_to_declared_law(k2, k_upper):
+    """Does v2's k match the Beta(1,20)*k_upper it CLAIMS to draw from? One-sample KS.
+
+    This exists because the v1 comparison alone cannot answer it. If v1's population is censored
+    (see `diagnose_v1_truncation`), then "v2 differs from v1" is uninformative about v2 -- and a
+    reviewer who stops there can be talked into excusing a genuine v2 error, e.g. `k_hat * 8`
+    instead of `k_hat * 10`, on the grounds that v1 is censored anyway. So v2 is held to its own
+    declaration, with no reference to v1 at all.
+
+    Beta(1,b) has the closed-form CDF 1-(1-x)^b, so this needs no scipy.
+    """
+    x = np.sort(np.asarray(k2, float)) / k_upper
+    if x.size == 0 or x[0] < 0 or x[-1] > 1:
+        return {"pass": False, "why": "values outside [0, k_upper]", "ks_d": float("nan")}
+    n = x.size
+    cdf = 1.0 - (1.0 - x) ** 20
+    d = float(max(np.max(np.arange(1, n + 1) / n - cdf), np.max(cdf - np.arange(0, n) / n)))
+    lam = (math.sqrt(n) + 0.12 + 0.11 / math.sqrt(n)) * d
+    p = 2.0 * sum((-1) ** (j - 1) * math.exp(-2.0 * j * j * lam * lam) for j in range(1, 101))
+    p = min(1.0, max(0.0, p))
+    return {"pass": bool(p > 0.01), "ks_d": d, "ks_p": p,
+            "mean_observed": float(np.mean(k2)), "mean_declared": k_upper / 21.0}
 
 
 def diagnose_v1_truncation(k1):
@@ -181,20 +212,43 @@ def main():
         print(f"    v1's observed mean                 {trunc['observed_mean']:.5f}")
         print(f"    implied peptides lost by v1        {trunc['implied_fraction_lost']*100:.1f}%")
         if trunc["explains_shift"]:
-            print("    => the k shift is v1 DELETING its small-k peptides (they elute in no frame),")
-            print("       not a v2 error. v2 matches the declared Beta(1,20)*10; v1's surviving")
-            print("       population is that draw conditioned on k > floor. The two tools do NOT")
-            print("       render the same peptide set, which the benchmark must declare.")
-            ok_k = True
+            print("    => CONSISTENT with v1 deleting its small-k peptides (they elute in no frame).")
+            print("       NOTE this is a hypothesis fitted to v1's own order statistic, not a")
+            print("       measurement of its cutoff, and v1's removal may depend on sigma as well as")
+            print("       k. It EXPLAINS the divergence; it does not license ignoring it.")
         else:
             print("    => does NOT explain the shift; treat the k mismatch as a real divergence.")
 
+    # v2 against its OWN declaration -- the check that does not depend on v1 being uncensored.
+    conf = conforms_to_declared_law(k2, a.k_upper)
+    print(f"\n{'=' * 74}\nv2 vs its DECLARED law: Beta(1,20)*{a.k_upper}   "
+          f"[{'PASS' if conf['pass'] else 'FAIL'}]\n{'=' * 74}")
+    print(f"  one-sample KS D {conf['ks_d']:8.5f}   p = {conf.get('ks_p', float('nan')):.3g}")
+    print(f"  mean observed   {conf.get('mean_observed', float('nan')):8.5f}   "
+          f"declared {conf.get('mean_declared', float('nan')):.5f}")
+    print("  (independent of v1. A censored v1 makes 'v2 != v1' uninformative about v2, so v2 is")
+    print("   held to its own declaration -- otherwise a real v2 error could be excused as v1 noise.)")
+    jk["v2_conforms_to_declared_law"] = conf
+
     if a.json:
         with open(a.json, "w") as f:
-            json.dump({"gradient_seconds": grad, "band_seconds": list(band),
-                       "sigma": js, "k": jk, "pass": bool(ok_s and ok_k)}, f, indent=2)
-    print(f"\n{'=' * 74}\nOVERALL: {'PASS' if ok_s and ok_k else 'FAIL'}\n{'=' * 74}")
-    return 0 if (ok_s and ok_k) else 1
+            json.dump({"gradient_seconds": grad, "band_seconds": list(band), "sigma": js, "k": jk,
+                       "v2_conforms": conf["pass"], "parity": bool(ok_s and ok_k)}, f, indent=2)
+
+    # THREE verdicts, deliberately not collapsed into one. An earlier version flipped the parity
+    # result to PASS once the survivorship story fit, which turns an explanation into a rubber stamp:
+    # any v2 error would be excused whenever v1 happened to be censored. What v1 does and whether v2
+    # is correct are different questions and are reported as such.
+    print(f"\n{'=' * 74}")
+    print(f"  v2 conforms to its declared law : {'PASS' if conf['pass'] else 'FAIL'}")
+    print(f"  v1/v2 population parity         : {'PASS' if ok_s and ok_k else 'DIVERGENT'}")
+    if conf["pass"] and not (ok_s and ok_k):
+        print("  => v2 is correct BY ITS OWN DECLARATION and the populations still differ, so the")
+        print("     divergence is in what v1 renders, not in what v2 draws. The benchmark must")
+        print("     declare that the two tools do not render the same peptide set.")
+    print(f"{'=' * 74}")
+    # Non-zero unless v2 conforms AND parity holds: a divergence stays visible to CI either way.
+    return 0 if (conf["pass"] and ok_s and ok_k) else 1
 
 
 if __name__ == "__main__":

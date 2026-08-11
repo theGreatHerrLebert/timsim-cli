@@ -642,6 +642,18 @@ fn main() -> Result<()> {
             }
             let e = match draws {
                 Some((sig, kh)) => {
+                    // A NULL draw is not a usable shape. The columns are declared non-nullable, so
+                    // presence and type were checked at the batch level — but a null ROW would have
+                    // reached `value(i)` and come back as whatever the buffer held, silently
+                    // rendering a peak nobody drew. Per-peptide mode promises absence is an error;
+                    // that promise has to cover rows, not just columns.
+                    if !Array::is_valid(sig, i) || !Array::is_valid(kh, i) {
+                        return Err(anyhow!(
+                            "peptide {}: peptide_rt has a NULL {} / {} — the draw columns must be \
+                             complete; re-run timsim-rt",
+                            id.value(i), RT::SIGMA_HAT, RT::K_HAT
+                        ));
+                    }
                     let (sf, shape) = timsim_cli::render::rt_shape_for_peptide(
                         sig.value(i), kh.value(i), gradient_seconds, a.cycle_seconds, a.n_sigma,
                     )
@@ -649,16 +661,31 @@ fn main() -> Result<()> {
                     // Recorded from the SAME value that reaches the ion, at the point it is
                     // resolved — not recomputed later from the inputs, which could agree with the
                     // descriptor while disagreeing with what was rendered.
-                    realized.push(id.value(i), sf, &shape);
                     Elution { sigma_frames: sf, shape }
                 }
                 None => global_elution,
             };
-            rt.insert(id.value(i), (idx.value(i), e));
+            // A duplicate id would OVERWRITE, so only the last row's shape would render while the
+            // digest recorded every row — a provenance record describing peaks that were never
+            // deposited. Refuse instead: the id is supposed to be unique in this table.
+            if rt.insert(id.value(i), (idx.value(i), e)).is_some() {
+                return Err(anyhow!(
+                    "peptide_rt has duplicate rows for peptide {} — peptide_id must be unique, or \
+                     the rendered shape and the recorded one disagree", id.value(i)
+                ));
+            }
         }
     }
     let prov = if a.peak_shape.is_per_peptide() {
         let (lo_s, hi_s) = timsim_cli::render::rt_sigma_band_seconds(gradient_seconds);
+        // Built from the deduplicated MAP, not the row stream: the digest claims to describe the
+        // shapes this run uses, and rows that were overwritten or skipped never reach an ion. (It is
+        // still the loaded RT population rather than the subset that ends up depositing signal —
+        // `--limit` and precursor-less peptides are not excluded — so it commits to "the shapes
+        // available to this render", which is what the key name has to mean.)
+        for (pid, (_, e)) in rt.iter() {
+            realized.push(*pid, e.sigma_frames, &e.shape);
+        }
         let realized = realized.finish();
         let (n_shaped, n_collapsed) = (realized.n_shaped, realized.n_gaussian_collapsed);
         let mut widths: Vec<f64> = rt.values().map(|(_, e)| e.sigma_frames).collect();
@@ -1394,7 +1421,14 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 cands.push(Candidate {
                     precursor_id: pcid.value(i), order, apex_frame, scan_apex: scan,
                     mono_mz, largest_mz, average_mz, charge: chg.value(i).max(1) as i64, abundance,
-                    sigma_frames: g.sigma_frames, n_sigma: g.n_sigma, shape: g.shape,
+                    // THIS peptide's peak, not the run's. `Candidate::shape` states the requirement:
+                    // it must be the value the deposition render uses, or the scheme ranks
+                    // precursors by an MS1 intensity the writer never deposits. Per-peptide shapes
+                    // broke that silently — `DdaIon` below took the per-peptide `elution` while this
+                    // took the global one, so selection and deposition disagreed about the same
+                    // ion's height and the DDA answer key would list precursors chosen on an
+                    // intensity that was never written.
+                    sigma_frames: elution.sigma_frames, n_sigma: g.n_sigma, shape: elution.shape,
                 });
             }
             ions.insert(pcid.value(i), DdaIon { peptide_id: pid.value(i), apex_frame, scan, abundance, ms1, ms2, elution });

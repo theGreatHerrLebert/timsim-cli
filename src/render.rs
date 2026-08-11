@@ -1205,11 +1205,14 @@ mod tests {
         let cube = sweep_render(std::slice::from_ref(&ion), &g);
         let emitted: f64 = cube.values().sum();
 
-        let fhalf = g.n_sigma * g.sigma_frames;
+        // From the ION's own peak, not the geometry's. They happen to be equal in this fixture, so
+        // reading `g` here would let the test pass by coincidence and keep passing if the render
+        // stopped honouring per-ion widths entirely.
+        let fhalf = g.n_sigma * ion.elution.sigma_frames;
         let shalf = g.n_sigma * g.sigma_scans;
         let (fs, fe) = ((ion.apex_frame - fhalf).floor() as i64, (ion.apex_frame + fhalf).floor() as i64);
         let (ss, se) = ((ion.scan_center - shalf).floor() as i64, (ion.scan_center + shalf).floor() as i64);
-        let frame_mass: f64 = (fs..=fe).map(|f| gauss_frac(f as f64 - 0.5, f as f64 + 0.5, ion.apex_frame, g.sigma_frames)).sum();
+        let frame_mass: f64 = (fs..=fe).map(|f| gauss_frac(f as f64 - 0.5, f as f64 + 0.5, ion.apex_frame, ion.elution.sigma_frames)).sum();
         let scan_mass: f64 = (ss..=se).map(|s| gauss_frac(s as f64 - 0.5, s as f64 + 0.5, ion.scan_center, g.sigma_scans)).sum();
         let peak_sum: f64 = ion.peaks.iter().map(|&(_, iv)| iv as f64).sum();
         let expected = ion.abundance * frame_mass * scan_mass * peak_sum;
