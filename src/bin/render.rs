@@ -841,6 +841,9 @@ fn main() -> Result<()> {
     let amounts = load_amounts(&a.peptide_quantities, &a.sample)?;
     let mut ions: Vec<Ion> = Vec::new();
     let mut skipped = 0usize;
+    // Ions the instrument's mobility window cannot record. Counted, not silently dropped:
+    // a filter whose losses are unreported is indistinguishable from a bug.
+    let mut n_out_of_mobility = 0usize;
     'outer: for b in timsim_schema::read(&a.precursors, PRE::TABLE)? {
         let pcid: &UInt64Array = b.column_by_name(PRE::PRECURSOR_ID).unwrap().as_any().downcast_ref().unwrap();
         let pid: &UInt64Array = b.column_by_name(PRE::PEPTIDE_ID).unwrap().as_any().downcast_ref().unwrap();
@@ -855,7 +858,7 @@ fn main() -> Result<()> {
             // Map the index range onto the LAST valid 0-based frame (n_frames - 1); scaling by n_frames
             // puts index_max one frame past the end (and disagrees with the DIA path).
             let apex_frame = (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
-            let (scan, sigma_scans) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, &p, &mob);
+            let Some((scan, sigma_scans)) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, &p, &mob) else { n_out_of_mobility += 1; continue };
 
             let peaks: Vec<(u32, f32)> = spec
                 .iter()
@@ -880,6 +883,9 @@ fn main() -> Result<()> {
                 break 'outer;
             }
         }
+    }
+    if n_out_of_mobility > 0 {
+        eprintln!("  {n_out_of_mobility} ion(s) outside the mobility window [{:.3}, {:.3}] — dropped, not clamped (v1: simulator.py:2291)", p.im_min, p.im_max);
     }
     eprintln!(
         "  projected {} ions ({} skipped: no in-range peaks) — rendering to {}",
@@ -1416,7 +1422,7 @@ fn place_scan(
     ccs: &HashMap<u64, (f64, Option<f64>)>,
     p: &Placement,
     mob: &MobilityWidth,
-) -> (f64, f64) {
+) -> Option<(f64, f64)> {
     // A non-finite or non-positive CCS is not a mobility: Mason-Schamp would hand back garbage and
     // the ion would silently land at scan 0 with a fallback width, looking like a real placement.
     let entry = ccs.get(&pcid).filter(|(c, _)| c.is_finite() && *c > 0.0);
@@ -1427,10 +1433,21 @@ fn place_scan(
             p.im_min + (p.im_max - p.im_min) * f
         }
     };
-    // ONE mobility for both the centre and the width. Deriving the width from the unclamped value
-    // while placing the centre at the clamped one gives an out-of-band ion a peak whose width comes
-    // from a mobility it was never rendered at.
-    let placed_k0 = one_over_k0.clamp(p.im_min, p.im_max);
+    // An ion outside the mobility acquisition window is NOT RECORDED — it is dropped, not clamped.
+    //
+    // v2 clamped it to the nearest edge scan and deposited its full signal there, inventing a peak
+    // the instrument could never have seen. That is exactly what v1 refuses to do
+    // (`simulator.py:2291`, "N ions in the mobility window [lo, hi] (M outside)"), and it is what
+    // v2's OWN m/z handling already does on the other axis — out-of-range peaks are dropped, not
+    // piled into the last TOF bin. The mobility axis was the inconsistent one.
+    //
+    // Measured consequence of clamping: 1+ ions have roughly double the 1/K0 of a 2+ ion of the same
+    // peptide, so nearly all of them sit above the window ceiling. v1 renders 3 of them; v2 was
+    // rendering 5.2% of its total ion signal as clamped-to-the-edge 1+ phantoms.
+    if one_over_k0 < p.im_min || one_over_k0 > p.im_max {
+        return None;
+    }
+    let placed_k0 = one_over_k0;
     let scan = (p.to_scan)(placed_k0).min(p.n_scans - 1);
     // The scan<->1/K0 map is NONLINEAR (Bruker ModelType-2), so a width in 1/K0 is a different
     // number of scans at each end of the ramp. Take the local slope from the calibration itself,
@@ -1447,7 +1464,7 @@ fn place_scan(
             timsim_cli::render::mobility_sigma_scans(c, sd, placed_k0, slope, mob.target, mob.reference)
         })
         .unwrap_or(mob.fallback_sigma_scans);
-    (scan as f64, sigma)
+    Some((scan as f64, sigma))
 }
 
 /// How this run turns the CCS model's per-ion uncertainty into a mobility width.
@@ -1523,6 +1540,9 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
     let mut ions: HashMap<u64, DdaIon> = HashMap::new();
     let mut cands: Vec<Candidate> = Vec::new();
     let mut order: u32 = 0;
+    // Ions the instrument's mobility window cannot record. Counted, not silently dropped:
+    // a filter whose losses are unreported is indistinguishable from a bug.
+    let mut n_out_of_mobility = 0usize;
     'outer: for b in timsim_schema::read_stream(&a.precursors, PRE::TABLE)? {
         let b = b?;
         let pcid: &UInt64Array = b.column_by_name(PRE::PRECURSOR_ID).unwrap().as_any().downcast_ref().unwrap();
@@ -1536,7 +1556,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             let Some(&(rt_index, elution)) = rt.get(&pid.value(i)) else { continue };
             let Some(ms1raw) = ms1_raw.remove(&pcid.value(i)) else { continue };
             let apex_frame = 1.0 + (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
-            let (scan_f, sigma_scans) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p, mob);
+            let Some((scan_f, sigma_scans)) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p, mob) else { n_out_of_mobility += 1; continue };
             let scan = scan_f as i64;
             let amount = amounts.get(&pid.value(i)).copied().unwrap_or(1.0);
             let abundance = amount * ionz.value(i) as f64 * mff.value(i) as f64 * frac.value(i) as f64;
@@ -1564,6 +1584,9 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             order += 1;
             if a.limit > 0 && ions.len() >= a.limit { break 'outer; }
         }
+    }
+    if n_out_of_mobility > 0 {
+        eprintln!("  {n_out_of_mobility} ion(s) outside the mobility window [{:.3}, {:.3}] — dropped, not clamped (v1: simulator.py:2291)", p.im_min, p.im_max);
     }
 
     let params = SelectionParams {
@@ -1868,6 +1891,9 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
     }
     let mut meta: HashMap<u64, IonMeta> = HashMap::new();
     let mut order: u32 = 0;
+    // Ions the instrument's mobility window cannot record. Counted, not silently dropped:
+    // a filter whose losses are unreported is indistinguishable from a bug.
+    let mut n_out_of_mobility = 0usize;
     'outer: for b in timsim_schema::read_stream(&a.precursors, PRE::TABLE)? {
         let b = b?;
         let pcid: &UInt64Array = b.column_by_name(PRE::PRECURSOR_ID).unwrap().as_any().downcast_ref().unwrap();
@@ -1881,7 +1907,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             let Some(&(rt_index, elution)) = rt.get(&pid.value(i)) else { continue };
             // 1-based apex frame (the DIA schedule + Frames.Id are 1-based).
             let apex_frame = 1.0 + (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
-            let (scan, sigma_scans) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p, mob);
+            let Some((scan, sigma_scans)) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p, mob) else { n_out_of_mobility += 1; continue };
             // v1's `events`: amount_amol (per sample) × ionisation propensity × modform fraction ×
             // charge fraction. amount 1.0 when no quantities given (propensities-only fallback).
             let amount = amounts.get(&pid.value(i)).copied().unwrap_or(1.0);
@@ -1903,6 +1929,9 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 break 'outer;
             }
         }
+    }
+    if n_out_of_mobility > 0 {
+        eprintln!("  {n_out_of_mobility} ion(s) outside the mobility window [{:.3}, {:.3}] — dropped, not clamped (v1: simulator.py:2291)", p.im_min, p.im_max);
     }
 
     // Chunk the run into apex-ordered frame ranges; each chunk streams ion_spectra once and holds only the
