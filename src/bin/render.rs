@@ -689,9 +689,13 @@ fn main() -> Result<()> {
                   a.target_p, n, a.n_sigma, (n / a.n_sigma - 1.0) * 100.0);
         a.n_sigma = n;
     }
+    for (name, v) in [("--run-rt-sd", a.run_rt_sd), ("--run-im-sd", a.run_im_sd), ("--run-intensity-cv", a.run_intensity_cv)] {
+        if !(v.is_finite() && v >= 0.0) {
+            return Err(anyhow!("{name} must be finite and >= 0 (0 = off), got {v}"));
+        }
+    }
     // Run-to-run jitter, converted from the units a user thinks in (seconds, 1/K0) into the units the
     // render works in (frames, scans). Done once so no call site re-derives it.
-    let k0_span = (p.im_max - p.im_min).abs().max(1e-12);
     let jitter = RunJitter {
         sample_key: {
             let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -701,14 +705,14 @@ fn main() -> Result<()> {
             splitmix64(h ^ a.noise_seed)
         },
         rt_sd_frames: if a.cycle_seconds > 0.0 { a.run_rt_sd / a.cycle_seconds } else { 0.0 },
-        im_sd_scans: a.run_im_sd / (k0_span / (p.n_scans.max(2) - 1) as f64),
+        im_sd_k0: a.run_im_sd,
         intensity_cv: a.run_intensity_cv,
     };
     if !jitter.is_off() {
         eprintln!(
-            "  run-to-run jitter: RT sd {:.3} s ({:.2} frames), mobility sd {:.5} 1/K0 ({:.2} scans), \
-             intensity CV {:.1}% — keyed on sample {:?}",
-            a.run_rt_sd, jitter.rt_sd_frames, a.run_im_sd, jitter.im_sd_scans,
+            "  run-to-run jitter: RT sd {:.3} s ({:.2} frames), mobility sd {:.5} 1/K0 (applied \
+             before the acquisition-window test), intensity CV {:.1}% — keyed on sample {:?}",
+            a.run_rt_sd, jitter.rt_sd_frames, a.run_im_sd,
             a.run_intensity_cv * 100.0, a.sample.as_deref().unwrap_or("")
         );
     }
@@ -923,7 +927,7 @@ fn main() -> Result<()> {
             let apex_frame = (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
             let (d_rt, d_im, i_fac) = jitter.draw(pcid.value(i));
             let apex_frame = apex_frame + d_rt;
-            let Some((scan, sigma_scans)) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, &p, &mob) else { n_out_of_mobility += 1; continue };
+            let Some((scan, sigma_scans)) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, &p, &mob, d_im) else { n_out_of_mobility += 1; continue };
 
             let peaks: Vec<(u32, f32)> = spec
                 .iter()
@@ -943,7 +947,7 @@ fn main() -> Result<()> {
             }
             let amount = amounts.get(&pid.value(i)).copied().unwrap_or(1.0);
             let abundance = amount * ionz.value(i) as f64 * mff.value(i) as f64 * frac.value(i) as f64;
-            ions.push(Ion { apex_frame, scan_center: (scan + d_im).clamp(0.0, (p.n_scans - 1) as f64), abundance: abundance * i_fac, peaks, elution, sigma_scans });
+            ions.push(Ion { apex_frame, scan_center: scan, abundance: abundance * i_fac, peaks, elution, sigma_scans });
             if a.limit > 0 && ions.len() >= a.limit {
                 break 'outer;
             }
@@ -1159,7 +1163,7 @@ fn dedup_and_quantise_into(
         // counts lifted from a real file — it already carries its own shot noise, and drawing Poisson
         // over it again would inflate the background's variance without changing its mean.
         let signal = match shot {
-            Some((frame, seed)) => poisson_draw(v * scale, ((frame as u64) << 40) ^ key, seed),
+            Some((frame, seed)) => poisson_draw(v * scale, splitmix64(splitmix64(frame as u64) ^ key), seed),
             None => v * scale,
         };
         let combined = signal + noise_at.remove(&key).unwrap_or(0.0);
@@ -1484,15 +1488,19 @@ fn noise_state(pc: u64, is_frag: bool, k: usize, seed: u64) -> u64 {
 struct RunJitter {
     sample_key: u64,
     rt_sd_frames: f64,
-    im_sd_scans: f64,
+    im_sd_k0: f64,
     intensity_cv: f64,
 }
 
 impl RunJitter {
     fn is_off(&self) -> bool {
-        self.rt_sd_frames == 0.0 && self.im_sd_scans == 0.0 && self.intensity_cv == 0.0
+        self.rt_sd_frames == 0.0 && self.im_sd_k0 == 0.0 && self.intensity_cv == 0.0
     }
-    /// `(d_apex_frame, d_scan, intensity_factor)` for one precursor in this run.
+    /// `(d_apex_frame, d_one_over_k0, intensity_factor)` for one precursor in this run.
+    ///
+    /// The mobility term stays in 1/K0 — the scan<->1/K0 map is NONLINEAR, so converting a requested
+    /// 1/K0 spread through one full-ramp average would make the realised physical spread depend on
+    /// where the ion sits. `place_scan` maps it locally instead.
     fn draw(&self, pcid: u64) -> (f64, f64, f64) {
         if self.is_off() {
             return (0.0, 0.0, 1.0);
@@ -1513,7 +1521,7 @@ impl RunJitter {
         } else {
             1.0
         };
-        (g(0x1111) * self.rt_sd_frames, g(0x2222) * self.im_sd_scans, f)
+        (g(0x1111) * self.rt_sd_frames, g(0x2222) * self.im_sd_k0, f)
     }
 }
 
@@ -1552,9 +1560,12 @@ fn gauss_unit(pc: u64, is_frag: bool, k: usize, seed: u64) -> f64 {
 /// Two regimes, because one algorithm cannot do both well:
 /// * `lambda < 30` — Knuth's product-of-uniforms. Exact, and the loop length is O(lambda) so it is
 ///   cheap precisely where it matters (the near-floor population that dominates real data).
-/// * `lambda >= 30` — the normal approximation `lambda + sqrt(lambda)*Z`. The relative error of that
-///   approximation is under a part in 1e3 by 30, and at 2.6e9 peaks per run the exact algorithm's
-///   O(lambda) loop is not affordable.
+/// * `lambda >= 30` — the normal approximation `round(lambda + sqrt(lambda)*Z)`. This is APPROXIMATE,
+///   not Poisson: it matches the first two moments but not the skew or the tails, and the rounding
+///   adds ~1/12 to the variance (0.3% at lambda = 30, less above). At 2.6e9 bins per run the exact
+///   O(lambda) loop is not affordable, and shot noise matters most near the floor where the exact
+///   branch runs. Stated plainly rather than claimed exact — if tail fidelity at high counts ever
+///   matters, swap in a transformed-rejection sampler.
 #[inline]
 fn poisson_draw(lambda: f64, key: u64, seed: u64) -> f64 {
     if !(lambda > 0.0) {
@@ -1568,7 +1579,10 @@ fn poisson_draw(lambda: f64, key: u64, seed: u64) -> f64 {
         loop {
             z = splitmix64(z);
             prod *= to01(z).max(1e-300);
-            if prod <= limit || k > 400 {
+            // No iteration cap: for lambda < 30 the loop terminates with probability 1 and its length
+            // is O(lambda). An escape hatch here would silently truncate a legitimate tail draw, which
+            // is a wrong number dressed as a safety measure.
+            if prod <= limit {
                 return k as f64;
             }
             k += 1;
@@ -1596,6 +1610,13 @@ fn place_scan(
     ccs: &HashMap<u64, (f64, Option<f64>)>,
     p: &Placement,
     mob: &MobilityWidth,
+    // Run-to-run mobility perturbation, in 1/K0. Applied BEFORE the acquisition-window test, because
+    // that is where it physically happens: a re-injection moves the ion's mobility, and whether the
+    // instrument can see it follows from the moved value. Adding it to the SCAN afterwards was wrong
+    // twice over — it let a jittered-out-of-window ion be clamped back to an edge scan (reinstating
+    // the exact defect the drop was added to fix), and it prevented a nominally out-of-window ion
+    // from ever jittering back IN.
+    d_k0: f64,
 ) -> Option<(f64, f64)> {
     // A non-finite or non-positive CCS is not a mobility: Mason-Schamp would hand back garbage and
     // the ion would silently land at scan 0 with a fallback width, looking like a real placement.
@@ -1618,6 +1639,7 @@ fn place_scan(
     // Measured consequence of clamping: 1+ ions have roughly double the 1/K0 of a 2+ ion of the same
     // peptide, so nearly all of them sit above the window ceiling. v1 renders 3 of them; v2 was
     // rendering 5.2% of its total ion signal as clamped-to-the-edge 1+ phantoms.
+    let one_over_k0 = one_over_k0 + d_k0;
     if one_over_k0 < p.im_min || one_over_k0 > p.im_max {
         return None;
     }
@@ -1732,7 +1754,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             let apex_frame = 1.0 + (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
             let (d_rt, d_im, i_fac) = jit.draw(pcid.value(i));
             let apex_frame = apex_frame + d_rt;
-            let Some((scan_f, sigma_scans)) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p, mob) else { n_out_of_mobility += 1; continue };
+            let Some((scan_f, sigma_scans)) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p, mob, d_im) else { n_out_of_mobility += 1; continue };
             let scan = scan_f as i64;
             let amount = amounts.get(&pid.value(i)).copied().unwrap_or(1.0);
             let abundance = amount * ionz.value(i) as f64 * mff.value(i) as f64 * frac.value(i) as f64;
@@ -1757,7 +1779,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 });
             }
             ions.insert(pcid.value(i), DdaIon { peptide_id: pid.value(i), apex_frame,
-                scan: ((scan as f64 + d_im).round() as i64).clamp(0, (p.n_scans - 1) as i64),
+                scan,
                 abundance: abundance * i_fac, ms1, ms2, elution, sigma_scans });
             order += 1;
             if a.limit > 0 && ions.len() >= a.limit { break 'outer; }
@@ -2087,7 +2109,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             let apex_frame = 1.0 + (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
             let (d_rt, d_im, i_fac) = jit.draw(pcid.value(i));
             let apex_frame = apex_frame + d_rt;
-            let Some((scan, sigma_scans)) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p, mob) else { n_out_of_mobility += 1; continue };
+            let Some((scan, sigma_scans)) = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p, mob, d_im) else { n_out_of_mobility += 1; continue };
             // v1's `events`: amount_amol (per sample) × ionisation propensity × modform fraction ×
             // charge fraction. amount 1.0 when no quantities given (propensities-only fallback).
             let amount = amounts.get(&pid.value(i)).copied().unwrap_or(1.0);
@@ -2101,7 +2123,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 pcid.value(i),
                 IonMeta {
                     apex_frame,
-                    scan: (scan + d_im).clamp(0.0, (p.n_scans - 1) as f64),
+                    scan,
                     abundance: abundance * i_fac,
                     precursor_mz: mz.value(i), survival, order,
                     peptide_id: pid.value(i), charge: chg.value(i).max(1) as i64, elution, sigma_scans,
@@ -2835,7 +2857,7 @@ mod noise_tests {
     /// Run-to-run jitter must vary BETWEEN runs and be reproducible WITHIN one.
     #[test]
     fn run_jitter_is_per_run_and_reproducible() {
-        let mk = |key: u64| super::RunJitter { sample_key: key, rt_sd_frames: 3.0, im_sd_scans: 2.0, intensity_cv: 0.2 };
+        let mk = |key: u64| super::RunJitter { sample_key: key, rt_sd_frames: 3.0, im_sd_k0: 0.01, intensity_cv: 0.2 };
         let (a, b) = (mk(11), mk(22));
         // same run, same ion -> identical (a re-render must reproduce the run exactly)
         assert_eq!(a.draw(1234), a.draw(1234));
@@ -2845,7 +2867,7 @@ mod noise_tests {
         // different ion, same run -> different
         assert_ne!(a.draw(1234), a.draw(1235));
         // off means OFF: exactly neutral, so the noiseless render stays byte-identical
-        let off = super::RunJitter { sample_key: 11, rt_sd_frames: 0.0, im_sd_scans: 0.0, intensity_cv: 0.0 };
+        let off = super::RunJitter { sample_key: 11, rt_sd_frames: 0.0, im_sd_k0: 0.0, intensity_cv: 0.0 };
         assert_eq!(off.draw(1234), (0.0, 0.0, 1.0));
 
         // The intensity factor is LOGNORMAL with the requested CV and unit mean — it must not bias
@@ -2859,6 +2881,31 @@ mod noise_tests {
         assert!((m - 1.0).abs() < 0.01, "intensity factor mean {m}, must be ~1 (unbiased)");
         assert!((cv - 0.2).abs() < 0.01, "intensity CV {cv}, requested 0.2");
         assert!((0..n).all(|i| j.draw(i).2 > 0.0), "a multiplicative factor must never be <= 0");
+    }
+
+    /// Distinct detector bins must draw independently.
+    ///
+    /// The first version keyed on `(frame << 40) ^ ((scan << 32) | tof)`, whose frame and scan bit
+    /// ranges OVERLAP — so different `(frame, scan)` pairs collided and received the identical
+    /// deviate. A shot-noise field with structured correlations is worse than none, because it looks
+    /// like noise while carrying a pattern.
+    #[test]
+    fn shot_noise_keys_do_not_alias_across_frame_and_scan() {
+        let key = |frame: u32, scan: u32, tof: u32| {
+            super::splitmix64(super::splitmix64(frame as u64) ^ (((scan as u64) << 32) | tof as u64))
+        };
+        let mut seen = std::collections::HashSet::new();
+        for frame in 0..40u32 {
+            for scan in 0..40u32 {
+                for tof in 0..8u32 {
+                    assert!(seen.insert(key(frame, scan, tof)), "key collision at {frame},{scan},{tof}");
+                }
+            }
+        }
+        // The specific pair the reviewer named must differ.
+        assert_ne!(key(1, 0, 7), key(2, 256, 7));
+        // And the draws they produce must differ too.
+        assert_ne!(super::poisson_draw(5.0, key(1, 0, 7), 1), super::poisson_draw(5.0, key(2, 256, 7), 1));
     }
 
     #[test]
