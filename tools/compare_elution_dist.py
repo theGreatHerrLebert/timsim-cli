@@ -38,7 +38,55 @@ ACCEPT = {
     "sigma_w1_rel": 0.10,        # Wasserstein-1 within 10% of v1's own IQR
     "k_mean_rel": 0.05,          # k is a heavier-tailed draw; allow more
     "k_w1_rel": 0.15,
+    "mobility_mean_rel": 0.05,
+    "mobility_w1_rel": 0.15,
 }
+
+
+def v1_mobility(db):
+    """v1's realized per-ion mobility width, in 1/K0.
+
+    Read from the `ions` table AS STORED, not from the config's declared target. Those differ: on
+    V1-TINY the log says "Standard deviation distribution scaled from mean 0.0085 to 0.0090", and the
+    stored population averages 0.00701, because ions are removed AFTER the rescale and the survivors
+    are enriched in 2+ (the narrowest relative width). Comparing declared parameters would call this
+    a match; comparing realized populations does not.
+    """
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT charge, inv_mobility_gru_predictor, inv_mobility_gru_predictor_std FROM ions "
+            "WHERE inv_mobility_gru_predictor_std IS NOT NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        con.close()
+        return None, None
+    con.close()
+    z = np.array([r[0] for r in rows], float)
+    k0 = np.array([r[1] for r in rows], float)
+    sd = np.array([r[2] for r in rows], float)
+    ok = np.isfinite(k0) & np.isfinite(sd) & (k0 > 0) & (sd > 0)
+    return sd[ok], z[ok]
+
+
+def v2_mobility(precursors, ccs_parquet, target, reference):
+    """v2's per-ion width in 1/K0: k0 * (ccs_std/ccs) * (target/reference).
+
+    Mason-Schamp is linear through the origin, so the constant cancels and this needs no gas mass,
+    temperature or charge -- they are inside k0. Deliberately compared in 1/K0 rather than SCANS: the
+    scan conversion depends on the reference .d's calibration ramp, and folding that in would compare
+    two tools AND two instrument geometries at once.
+    """
+    import pyarrow.parquet as pq
+
+    pc = pq.read_table(precursors).to_pandas()
+    cc = pq.read_table(ccs_parquet).to_pandas()
+    d = pc.merge(cc, on="precursor_id")
+    d = d[np.isfinite(d.ccs) & (d.ccs > 0) & np.isfinite(d.ccs_std) & (d.ccs_std > 0)]
+    SC, MG, T = 18509.8632163405, 28.013, 31.85 + 273.15
+    rm = (d.mz * d.charge * MG) / (d.mz * d.charge + MG)
+    k0 = (np.sqrt(rm * T) * d.ccs) / (SC * d.charge)
+    return np.asarray(k0 * (d.ccs_std / d.ccs) * (target / reference)), np.asarray(d.charge, float)
 
 
 def v1_shapes(db):
@@ -185,6 +233,10 @@ def main():
                     help="gradient seconds for the v2 band; default = v1's own span, so the two are "
                          "compared under the SAME gradient (the band is gradient-dependent)")
     ap.add_argument("--k-upper", type=float, default=10.0)
+    ap.add_argument("--v2-precursors", default=None, help="v2 precursors.parquet (enables the mobility comparison)")
+    ap.add_argument("--v2-ccs", default=None, help="v2 precursor_ccs.parquet")
+    ap.add_argument("--mobility-target", type=float, default=0.009)
+    ap.add_argument("--mobility-reference", type=float, default=0.009197)
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
 
@@ -218,6 +270,49 @@ def main():
             print("       k. It EXPLAINS the divergence; it does not license ignoring it.")
         else:
             print("    => does NOT explain the shift; treat the k mismatch as a real divergence.")
+
+    # ---- mobility, if both sides can supply it ----
+    if a.v2_precursors:
+        m1, z1 = v1_mobility(a.v1)
+        if m1 is None:
+            print("\n(v1 db has no ions.inv_mobility_gru_predictor_std -- skipping mobility)")
+        else:
+            m2, z2 = v2_mobility(a.v2_precursors, a.v2_ccs, a.mobility_target, a.mobility_reference)
+            ok_m, jm = report("mobility sigma (1/K0)", m1, m2,
+                              ACCEPT["mobility_mean_rel"], ACCEPT["mobility_w1_rel"])
+            print("\n  BY CHARGE (v1 realized vs v2) -- one global gain does not equalise these")
+            print(f"    {'z':>3} {'n v1':>7} {'v1 mean':>10} {'n v2':>7} {'v2 mean':>10} {'delta':>9}")
+            for z in sorted(set(np.unique(z1)) | set(np.unique(z2))):
+                a1, a2 = m1[z1 == z], m2[z2 == z]
+                if a1.size and a2.size:
+                    print(f"    {int(z):>3} {a1.size:>7d} {a1.mean():>10.6f} {a2.size:>7d} "
+                          f"{a2.mean():>10.6f} {a2.mean() - a1.mean():>+9.6f}")
+            # Direct standardisation: v2's per-charge means reweighted to v1's charge MIX. If the
+            # marginal gap is confounding rather than a width error, this collapses it -- and if it
+            # does, reading the marginal alone would have condemned a model that is close to right.
+            w = np.array([np.mean(z1 == z) for z in sorted(set(np.unique(z1)))])
+            mu2 = np.array([m2[z2 == z].mean() if (z2 == z).any() else np.nan
+                            for z in sorted(set(np.unique(z1)))])
+            if not np.isnan(mu2).any():
+                std2 = float((w * mu2).sum())
+                raw = abs(m2.mean() - m1.mean()) / m1.mean()
+                adj = abs(std2 - m1.mean()) / m1.mean()
+                print(f"\n  CHARGE-MIX STANDARDISATION")
+                print(f"    v2 mean, v2's own charge mix   {m2.mean():.6f}   ({raw*100:5.1f}% from v1)")
+                print(f"    v2 mean, reweighted to v1's mix {std2:.6f}   ({adj*100:5.1f}% from v1)")
+                print(f"    v1 realized mean                {m1.mean():.6f}")
+                if adj < raw / 2:
+                    print("    => most of the marginal gap is CHARGE MIX, not the width model. The two")
+                    print("       tools populate charge states differently (v2 site-specific vs v1")
+                    print("       binomial + min_charge_contrib), so comparing marginals alone would")
+                    print("       have condemned a width model that is close to correct.")
+            print(f"\n  v2 targets {a.mobility_target} (v1's DECLARED inverse_mobility_std_mean).")
+            print(f"  v1's REALIZED population mean is {m1.mean():.6f} -- v1 rescales to its target and")
+            print("  then removes ions, so its declared parameter is not what it renders. Calibrating")
+            print("  v2 to the declared value is a CHOICE; it is stated here rather than hidden in a")
+            print("  constant, because targeting v1's realized value instead would import that artifact.")
+            jm["v1_realized_mean"] = float(m1.mean())
+            jm["v2_target"] = a.mobility_target
 
     # v2 against its OWN declaration -- the check that does not depend on v1 being uncensored.
     conf = conforms_to_declared_law(k2, a.k_upper)
