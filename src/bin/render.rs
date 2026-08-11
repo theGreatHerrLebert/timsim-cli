@@ -233,6 +233,19 @@ struct Args {
     /// carry their own shot noise. `off` (default) = byte-identical deterministic render.
     #[arg(long)]
     ion_count_noise: bool,
+    /// Instrument fluctuation, as a COEFFICIENT OF VARIATION per frame and per scan. `0` = off.
+    ///
+    /// v2's form of v1's `noise_frame_abundance` / `noise_scan_abundance`. Multiplicative and
+    /// intensity-INDEPENDENT, so unlike `--ion-count-noise` it roughens a BRIGHT peak's trace too —
+    /// which real data shows and counting statistics alone cannot produce (Poisson noise scales as
+    /// 1/sqrt(counts), so an abundant peptide comes out perfectly smooth).
+    ///
+    /// COMMON-MODE across every ion in a frame/scan, which is the departure from v1: the physics it
+    /// stands for — spray and pressure flicker, transmission and accumulation variation — moves all
+    /// ions together. v1 drew it per ion, making co-eluting peptides fluctuate independently and
+    /// destroying the correlation a search engine can exploit.
+    #[arg(long, default_value_t = 0.0)]
+    instrument_cv: f64,
     /// Run-to-run RT jitter, in SECONDS (standard deviation). `0` = off.
     ///
     /// A real re-injection does not put a peptide at exactly the same retention time. v1 had this as
@@ -994,7 +1007,7 @@ fn main() -> Result<()> {
             }
             next_fid += 1;
         }
-        let (scans, tofs, ints) = dedup_and_quantise(e.triples, a.intensity_scale, a.min_peak_intensity, &[], ion_count_key(&a, target));
+        let (scans, tofs, ints) = dedup_and_quantise(e.triples, a.intensity_scale, a.min_peak_intensity, &[], ion_count_key(&a, target), inst_key(&a, target));
         total_peaks += scans.len() as u64;
         if let Err(x) = write_frame(&mut writer, target, 0, a.cycle_seconds, scans, tofs, ints) {
             err = Err(x);
@@ -1125,9 +1138,10 @@ fn dedup_and_quantise(
     floor: u32,
     noise: &[(u32, u32, f64)],
     ion_count: Option<(u32, u64)>,
+    inst_jitter: Option<(u32, f64, u64)>,
 ) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let mut b = DedupBufs::default();
-    dedup_and_quantise_into(&mut b, triples, scale, floor, noise, ion_count);
+    dedup_and_quantise_into(&mut b, triples, scale, floor, noise, ion_count, inst_jitter);
     (b.scans, b.tofs, b.ints)
 }
 
@@ -1143,6 +1157,8 @@ fn dedup_and_quantise_into(
     // `(scan, tof)` bin draws independently in each frame — otherwise one ion's whole elution profile
     // would receive a single correlated deviate and the chromatogram would be smooth-but-wrong.
     ion_count: Option<(u32, u64)>,
+    // `(frame, cv, seed)` for the common-mode instrument fluctuation; `None` or cv=0 disables it.
+    inst_jitter: Option<(u32, f64, u64)>,
 ) {
     debug_assert!(scale.is_finite() && scale > 0.0, "intensity_scale must be finite and > 0");
     const CEIL: f64 = u32::MAX as f64;
@@ -1164,12 +1180,43 @@ fn dedup_and_quantise_into(
         // Add + consume any co-located background so a shared (scan, tof) bin isn't emitted twice. The
         // quantised value is the COMBINED synthetic+background count, so saturation is checked on it (a bin
         // below the ceiling in signal can cross it after real background).
-        // Counting statistics apply to the SYNTHETIC signal only. The A2 background is real detector
+            // Instrument-level multiplicative fluctuation, v2's form of v1's `noise_frame_abundance` /
+        // `noise_scan_abundance`. Applied per FRAME and per (frame, scan), COMMON-MODE across every
+        // ion in that frame/scan — because the physics it stands for is common-mode: spray and
+        // pressure flicker, transmission and accumulation variation all move every ion together.
+        // v1 drew it per ion, which makes co-eluting peptides fluctuate independently and destroys
+        // exactly the correlation a search engine can exploit.
+        //
+        // Complementary to --ion-count-noise, not a substitute. Counting statistics scale as
+        // 1/sqrt(counts), so they roughen a trace near the floor and leave a bright peak smooth.
+        // This one is intensity-INDEPENDENT, so it is what makes an abundant peptide's trace gritty
+        // too — which real data shows and Poisson alone cannot produce.
+        let inst = match inst_jitter {
+            Some((frame, cv, seed)) if cv > 0.0 => {
+                let g = |k: u64| {
+                    let z = splitmix64(splitmix64(seed ^ 0x51ED_2701) ^ k);
+                    let u1 = to01(splitmix64(z)).max(1e-12);
+                    let u2 = to01(splitmix64(z ^ 0xD1B5_4A32_D192_ED03));
+                    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+                };
+                // Lognormal, unit mean: a multiplicative factor must not bias the ion current, and an
+                // additive one would drive low bins negative.
+                let s2 = (1.0 + cv * cv).ln();
+                let f = |k: u64| (g(k) * s2.sqrt() - 0.5 * s2).exp();
+                f(frame as u64) * f(((frame as u64) << 20) ^ (scan as u64) ^ 0x9E37_79B9)
+            }
+            _ => 1.0,
+        };
+    // Counting statistics apply to the SYNTHETIC signal only. The A2 background is real detector
         // counts lifted from a real file — it already carries its own shot noise, and drawing Poisson
         // over it again would inflate the background's variance without changing its mean.
+        // Order matters: the instrument fluctuation scales the EXPECTED counts, and the detector then
+        // counts that. Applying Poisson first and scaling after would inflate the variance instead of
+        // modelling two stages.
+        let expected = v * scale * inst;
         let signal = match ion_count {
-            Some((frame, seed)) => poisson_draw(v * scale, splitmix64(splitmix64(frame as u64) ^ key), seed),
-            None => v * scale,
+            Some((frame, seed)) => poisson_draw(expected, splitmix64(splitmix64(frame as u64) ^ key), seed),
+            None => expected,
         };
         let combined = signal + noise_at.remove(&key).unwrap_or(0.0);
         if combined >= CEIL
@@ -1528,6 +1575,11 @@ impl RunJitter {
         };
         (g(0x1111) * self.rt_sd_frames, g(0x2222) * self.im_sd_k0, f)
     }
+}
+
+/// `(frame, cv, seed)` for the common-mode instrument fluctuation, or `None` when off.
+fn inst_key(a: &Args, frame: u32) -> Option<(u32, f64, u64)> {
+    (a.instrument_cv > 0.0).then_some((frame, a.instrument_cv, a.noise_seed))
 }
 
 /// `(frame, seed)` for the counting-statistics draw, or `None` when it is off.
@@ -1898,7 +1950,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                         }
                     }
                 }
-                let (scans, tofs, ints) = dedup_and_quantise(&tri, a.intensity_scale, a.min_peak_intensity, &[], ion_count_key(&a, frame));
+                let (scans, tofs, ints) = dedup_and_quantise(&tri, a.intensity_scale, a.min_peak_intensity, &[], ion_count_key(&a, frame), inst_key(&a, frame));
                 if is_ms1 { c_ms1 += scans.len() as u64 } else { c_ms2 += scans.len() as u64 }
                 let blk = ms_io::data::tdf_writer::encode_frame_block(&scans, &tofs, &ints, n_scans, compression_level)
                     .map_err(|e| e.to_string())?;
@@ -2290,6 +2342,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
         //    the Sync `apply_transmission`, and emits owned EncodedBlocks. Gated memory bounds the collect.
         type ChunkOut = (Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)>, u64, u64);
         let ion_count_seed: Option<u64> = a.ion_count_noise.then_some(a.noise_seed);
+    let inst_cv: Option<(f64, u64)> = (a.instrument_cv > 0.0).then_some((a.instrument_cv, a.noise_seed));
     let (n_scans, iscale, floor, noise_only) =
             (p.n_scans, a.intensity_scale, a.min_peak_intensity, a.noise_only);
         // With per-frame background (A2 / spike), every frame must be visited so its real peaks land even
@@ -2311,7 +2364,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 if err.is_some() { return; }
                 let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
                 let syn: &[(u32, u32, f64)] = if noise_only { &[] } else { tri };
-                dedup_and_quantise_into(&mut bufs, syn, iscale, floor, fnoise, ion_count_seed.map(|sd| (frame, sd)));
+                dedup_and_quantise_into(&mut bufs, syn, iscale, floor, fnoise, ion_count_seed.map(|sd| (frame, sd)), inst_cv.map(|(cv, sd)| (frame, cv, sd)));
                 if bufs.scans.is_empty() { return; } // truly-empty frame → gap (written empty on append)
                 if ms_type == 0 { c1 += bufs.scans.len() as u64 } else { c2 += bufs.scans.len() as u64 }
                 match ms_io::data::tdf_writer::encode_frame_block(&bufs.scans, &bufs.tofs, &bufs.ints, n_scans, 1) {
@@ -2416,7 +2469,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 }
                 let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
                 let syn: &[(u32, u32, f64)] = if a.noise_only { &[] } else { tri };
-                let (scans, tofs, ints) = dedup_and_quantise(syn, a.intensity_scale, a.min_peak_intensity, fnoise, a.ion_count_noise.then_some((frame, a.noise_seed)));
+                let (scans, tofs, ints) = dedup_and_quantise(syn, a.intensity_scale, a.min_peak_intensity, fnoise, a.ion_count_noise.then_some((frame, a.noise_seed)), inst_key(a, frame));
                 if scans.is_empty() {
                     return; // truly-empty frame → leave a gap (filled empty by the next write / trailing loop)
                 }
@@ -2443,6 +2496,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
                 &mut writer, &ions, &sched, g, fc0, fc1, emit_all, &frame_noise,
                 &ParallelRenderCfg {
                     ion_count_seed: a.ion_count_noise.then_some(a.noise_seed),
+                    instrument_cv: (a.instrument_cv > 0.0).then_some((a.instrument_cv, a.noise_seed)),
                     n_scans: p.n_scans,
                     intensity_scale: a.intensity_scale,
                     min_peak_intensity: a.min_peak_intensity,
@@ -2540,6 +2594,9 @@ struct ParallelRenderCfg {
     /// Seed for ion-counting statistics, or `None` when they are off. Carried on the config rather than
     /// read from `Args` because this path runs inside rayon and cannot borrow the CLI struct.
     ion_count_seed: Option<u64>,
+    /// `(cv, seed)` for the common-mode instrument fluctuation, carried on the config for the same
+    /// reason as the ion-count seed: this path runs inside rayon and cannot borrow the CLI struct.
+    instrument_cv: Option<(f64, u64)>,
     n_scans: u32,
     intensity_scale: f64,
     min_peak_intensity: u32,
@@ -2613,6 +2670,7 @@ fn render_range_parallel(
 
     type ChunkOut = (Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)>, u64, u64);
     let ion_count_seed: Option<u64> = cfg.ion_count_seed;
+    let inst_cv: Option<(f64, u64)> = cfg.instrument_cv;
     let (n_scans, iscale, floor, noise_only) =
         (cfg.n_scans, cfg.intensity_scale, cfg.min_peak_intensity, cfg.noise_only);
     // Encoded blocks are the only thing that crosses the rayon boundary, and they are held only until the
@@ -2644,7 +2702,7 @@ fn render_range_parallel(
                     }
                     let fnoise = frame_noise.get(&frame).map(|v| v.as_slice()).unwrap_or(&[]);
                     let syn: &[(u32, u32, f64)] = if noise_only { &[] } else { tri };
-                    dedup_and_quantise_into(&mut bufs, syn, iscale, floor, fnoise, ion_count_seed.map(|sd| (frame, sd)));
+                    dedup_and_quantise_into(&mut bufs, syn, iscale, floor, fnoise, ion_count_seed.map(|sd| (frame, sd)), inst_cv.map(|(cv, sd)| (frame, cv, sd)));
                     if bufs.scans.is_empty() {
                         return; // truly-empty frame → leave a gap (written empty on append)
                     }
