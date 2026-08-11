@@ -76,6 +76,211 @@ fn f64_str(v: f64) -> String {
     format!("{v:?}")
 }
 
+/// Bumped when the MEANING of any key changes. Readers must fail closed on an unknown major.
+pub const PROVENANCE_SCHEMA_VERSION: &str = "2";
+
+/// The elution IMPLEMENTATION, distinct from the law it implements.
+///
+/// The zero-`k` collapse threshold, the frame rounding and the EMG's derived constants live here.
+/// Any of them can move the rendered shapes while every other recorded field is unchanged — so a
+/// descriptor without this cannot recompute what the render did. That was the central finding of the
+/// review of `PEAK_SHAPE_PROVENANCE_V2.md`, against a first draft that called the descriptor "total".
+pub const ELUTION_MODEL_VERSION: &str = "timsim-elution/2";
+
+/// How `peptide_rt`'s draws are keyed, salts included. A different normalisation silently repoints
+/// every peptide at a different draw, so the key is part of the record.
+pub const IDENTITY_KEY: &str = "blake2b-64/sequence#rt_sigma|rt_k";
+
+/// Additional keys for the per-peptide record (parquet/Arrow spelling).
+pub const KEY_SCHEMA_VERSION: &str = "provenance_schema_version";
+pub const KEY_MODEL_VERSION: &str = "elution_model_version";
+pub const KEY_IDENTITY_KEY: &str = "identity_key";
+pub const KEY_SIGMA_LAW: &str = "sigma_law";
+pub const KEY_SIGMA_HAT_DIST: &str = "sigma_hat_dist";
+pub const KEY_K_HAT_DIST: &str = "k_hat_dist";
+pub const KEY_GRADIENT_SECONDS: &str = "gradient_seconds";
+pub const KEY_CYCLE_SECONDS: &str = "cycle_seconds";
+pub const KEY_SIGMA_BAND: &str = "sigma_band_seconds";
+pub const KEY_K_UPPER: &str = "k_upper";
+pub const KEY_REALIZED_DIGEST: &str = "realized_shape_digest";
+pub const KEY_N_SHAPED: &str = "n_peptides_shaped";
+pub const KEY_N_COLLAPSED: &str = "n_gaussian_collapsed";
+pub const KEY_SIGMA_STATS: &str = "sigma_frames_min_mean_max";
+pub const KEY_K_STATS: &str = "emg_k_min_mean_max";
+
+/// What actually came out of a per-peptide run.
+///
+/// The aggregates are a human-readable diagnostic. **The digest is the commitment**: six aggregates
+/// can be satisfied by a writer that computed them over the wrong population; a digest over the
+/// realized `(peptide, sigma, k)` set cannot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Realized {
+    pub n_shaped: usize,
+    pub n_gaussian_collapsed: usize,
+    pub sigma_frames_min: f64,
+    pub sigma_frames_mean: f64,
+    pub sigma_frames_max: f64,
+    pub emg_k_min: f64,
+    pub emg_k_mean: f64,
+    pub emg_k_max: f64,
+    /// `sha256` over the realized set in peptide-id order — see [`RealizedBuilder`].
+    pub digest: String,
+}
+
+/// Accumulates the realized set and commits to it.
+#[derive(Default)]
+pub struct RealizedBuilder {
+    rows: Vec<(u64, f64, f64)>,
+    n_gaussian_collapsed: usize,
+}
+
+impl RealizedBuilder {
+    pub fn push(&mut self, peptide_id: u64, sigma_frames: f64, shape: &PeakShape) {
+        if matches!(shape, PeakShape::Gaussian) {
+            self.n_gaussian_collapsed += 1;
+        }
+        self.rows.push((peptide_id, sigma_frames, shape.emg_k()));
+    }
+
+    /// Sorting by `peptide_id` rather than hashing in insertion order is load-bearing: the shapes
+    /// are accumulated from a `HashMap` whose iteration order is not stable between runs, so an
+    /// insertion-order digest would differ between two byte-identical renders — worse than useless,
+    /// because it would read as a detected difference.
+    pub fn finish(mut self) -> Realized {
+        use sha2::{Digest, Sha256};
+        self.rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.total_cmp(&b.2)));
+        let mut h = Sha256::new();
+        // Fixed-width big-endian BIT PATTERNS, not text: a formatted float is a precision-dependent
+        // encoding, and this digest has to be reproducible across producers.
+        h.update(PROVENANCE_SCHEMA_VERSION.as_bytes());
+        h.update([0u8]);
+        h.update(ELUTION_MODEL_VERSION.as_bytes());
+        h.update([0u8]);
+        for (pid, sigma, k) in &self.rows {
+            h.update(pid.to_be_bytes());
+            h.update(sigma.to_bits().to_be_bytes());
+            h.update(k.to_bits().to_be_bytes());
+        }
+        let digest = format!("{:x}", h.finalize());
+
+        let n = self.rows.len();
+        let (mut smin, mut smax, mut ssum) = (f64::INFINITY, f64::NEG_INFINITY, 0.0);
+        let (mut kmin, mut kmax, mut ksum) = (f64::INFINITY, f64::NEG_INFINITY, 0.0);
+        for (_, s, k) in &self.rows {
+            smin = smin.min(*s); smax = smax.max(*s); ssum += *s;
+            kmin = kmin.min(*k); kmax = kmax.max(*k); ksum += *k;
+        }
+        let d = n.max(1) as f64;
+        Realized {
+            n_shaped: n,
+            n_gaussian_collapsed: self.n_gaussian_collapsed,
+            sigma_frames_min: if n == 0 { 0.0 } else { smin },
+            sigma_frames_mean: ssum / d,
+            sigma_frames_max: if n == 0 { 0.0 } else { smax },
+            emg_k_min: if n == 0 { 0.0 } else { kmin },
+            emg_k_mean: ksum / d,
+            emg_k_max: if n == 0 { 0.0 } else { kmax },
+            digest,
+        }
+    }
+}
+
+/// How a run's elution shapes were produced — the ONE typed record every writer stamps.
+///
+/// Single type, single serialisation ([`Self::pairs`]), consumed by the Bruker `GlobalMetadata`
+/// writer and all four answer-key writers. None of them may recompute any of it independently, or
+/// four writers can disagree about one run.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ElutionProvenance {
+    /// One shape for the whole run. Keeps the historical three keys and their exact round trip.
+    Global { shape: PeakShape, n_sigma: f64 },
+    /// v1's model: width and tail drawn per peptide.
+    ///
+    /// Deliberately carries NO single `emg_k`. Writing the population mean into that key would be
+    /// worse than omitting it: a reader cannot tell a mean from a value, and would reconstruct a
+    /// kernel that no peak in the run actually had.
+    PerPeptide {
+        n_sigma: f64,
+        gradient_seconds: f64,
+        cycle_seconds: f64,
+        sigma_band_seconds: (f64, f64),
+        k_upper: f64,
+        realized: Realized,
+    },
+}
+
+impl ElutionProvenance {
+    /// The value written to `peak_shape` / `SimPeakShape`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ElutionProvenance::Global { shape, .. } => shape.name(),
+            ElutionProvenance::PerPeptide { .. } => "per-peptide",
+        }
+    }
+
+    /// THE canonical serialisation. Both spellings derive from this, so they cannot drift.
+    pub fn pairs(&self) -> Vec<(String, String)> {
+        let mut v = vec![(KEY_PEAK_SHAPE.to_string(), self.name().to_string())];
+        match self {
+            ElutionProvenance::Global { shape, n_sigma } => {
+                // Unchanged from schema v1, so an old reader still round-trips a global run exactly.
+                v.push((KEY_EMG_K.to_string(), f64_str(shape.emg_k())));
+                v.push((KEY_N_SIGMA.to_string(), f64_str(*n_sigma)));
+            }
+            ElutionProvenance::PerPeptide {
+                n_sigma, gradient_seconds, cycle_seconds, sigma_band_seconds, k_upper, realized,
+            } => {
+                v.push((KEY_N_SIGMA.to_string(), f64_str(*n_sigma)));
+                v.push((KEY_SCHEMA_VERSION.to_string(), PROVENANCE_SCHEMA_VERSION.to_string()));
+                v.push((KEY_MODEL_VERSION.to_string(), ELUTION_MODEL_VERSION.to_string()));
+                v.push((KEY_IDENTITY_KEY.to_string(), IDENTITY_KEY.to_string()));
+                v.push((KEY_SIGMA_LAW.to_string(), "gradient-affine/v1".to_string()));
+                v.push((KEY_SIGMA_HAT_DIST.to_string(), "beta(4,4)".to_string()));
+                v.push((KEY_K_HAT_DIST.to_string(), "beta(1,20)".to_string()));
+                v.push((KEY_GRADIENT_SECONDS.to_string(), f64_str(*gradient_seconds)));
+                v.push((KEY_CYCLE_SECONDS.to_string(), f64_str(*cycle_seconds)));
+                v.push((KEY_SIGMA_BAND.to_string(), format!(
+                    "[{},{}]", f64_str(sigma_band_seconds.0), f64_str(sigma_band_seconds.1))));
+                v.push((KEY_K_UPPER.to_string(), f64_str(*k_upper)));
+                v.push((KEY_REALIZED_DIGEST.to_string(), realized.digest.clone()));
+                v.push((KEY_N_SHAPED.to_string(), realized.n_shaped.to_string()));
+                v.push((KEY_N_COLLAPSED.to_string(), realized.n_gaussian_collapsed.to_string()));
+                v.push((KEY_SIGMA_STATS.to_string(), format!("{}/{}/{}",
+                    f64_str(realized.sigma_frames_min), f64_str(realized.sigma_frames_mean), f64_str(realized.sigma_frames_max))));
+                v.push((KEY_K_STATS.to_string(), format!("{}/{}/{}",
+                    f64_str(realized.emg_k_min), f64_str(realized.emg_k_mean), f64_str(realized.emg_k_max))));
+            }
+        }
+        v
+    }
+
+    /// The same record in Bruker `GlobalMetadata` spelling (`Sim`-prefixed, CamelCase).
+    pub fn tdf_pairs(&self) -> Vec<(String, String)> {
+        self.pairs().into_iter().map(|(k, v)| (tdf_key(&k), v)).collect()
+    }
+
+    pub fn schema_metadata(&self) -> HashMap<String, String> {
+        self.pairs().into_iter().collect()
+    }
+}
+
+/// `peak_shape` -> `SimPeakShape`. ONE mapping, so the two spellings cannot drift.
+fn tdf_key(k: &str) -> String {
+    let mut out = String::from("Sim");
+    let mut upper = true;
+    for c in k.chars() {
+        if c == '_' {
+            upper = true;
+        } else if upper {
+            out.extend(c.to_uppercase());
+            upper = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// The three `(key, value)` pairs describing a resolved shape, in Arrow/parquet spelling.
 pub fn shape_metadata(shape: &PeakShape, n_sigma: f64) -> Vec<(String, String)> {
     vec![
@@ -109,6 +314,13 @@ pub enum ProvenanceError {
     Malformed { key: &'static str, value: String },
     /// The stamp parsed but does not describe a shape this build can construct.
     Invalid(PeakShapeError),
+    /// The artifact was rendered with PER-PEPTIDE shapes, so "the run's shape" does not exist.
+    ///
+    /// Distinct from [`Self::Malformed`] on purpose: the record is well-formed and truthful, and the
+    /// caller's QUESTION is what has no answer. A reader that treats this as corruption will reach
+    /// for a fallback; one that reads it correctly knows to go to `peptide_rt` and the descriptor
+    /// keys instead.
+    NotASingleShape,
 }
 
 impl std::fmt::Display for ProvenanceError {
@@ -117,6 +329,11 @@ impl std::fmt::Display for ProvenanceError {
             ProvenanceError::Missing(k) => write!(f, "no peak-shape provenance: {k} absent"),
             ProvenanceError::Malformed { key, value } => write!(f, "peak-shape provenance {key}={value:?} is malformed"),
             ProvenanceError::Invalid(e) => write!(f, "recorded peak shape is not constructible: {e}"),
+            ProvenanceError::NotASingleShape => write!(
+                f,
+                "this artifact was rendered with per-peptide peak shapes, so it has no single \
+                 kernel; read `{KEY_SIGMA_BAND}`/`{KEY_K_UPPER}` and the peptide_rt draws instead"
+            ),
         }
     }
 }
@@ -168,6 +385,12 @@ pub fn parse_shape(name: &str, k: &str, n_sigma: &str) -> Result<PeakShape, Prov
                 .map_err(|_| ProvenanceError::Malformed { key: KEY_EMG_K, value: k.to_string() })?;
             PeakShape::emg(k, n_sigma).map_err(ProvenanceError::Invalid)
         }
+        // A per-peptide run HAS no single shape, so there is nothing honest to return. Failing here
+        // is the point: a caller that wants "the run's kernel" is asking a question with no answer,
+        // and any value handed back — the mean, the mode, the first peptide's — would be a kernel no
+        // peak in the run actually had, presented as if it were the run's. That is the exact defect
+        // this module exists to prevent, and it would be introduced BY the module.
+        "per-peptide" => Err(ProvenanceError::NotASingleShape),
         _ => Err(ProvenanceError::Malformed { key: KEY_PEAK_SHAPE, value: name.to_string() }),
     }
 }
@@ -197,13 +420,13 @@ pub fn read_parquet_shape(path: impl AsRef<std::path::Path>) -> Result<PeakShape
 /// (it rewrites `ClosedProperly` last), and ms-io exposes no seam for extra rows. `INSERT OR
 /// REPLACE` so re-stamping is idempotent.
 #[cfg(feature = "tdf")]
-pub fn stamp_tdf(d: impl AsRef<std::path::Path>, shape: &PeakShape, n_sigma: f64) -> Result<(), Box<dyn std::error::Error>> {
+pub fn stamp_tdf(d: impl AsRef<std::path::Path>, prov: &ElutionProvenance) -> Result<(), Box<dyn std::error::Error>> {
     let tdf = d.as_ref().join("analysis.tdf");
     let conn = rusqlite::Connection::open(&tdf)?;
     let tx = conn.unchecked_transaction()?;
     {
         let mut stmt = tx.prepare("INSERT OR REPLACE INTO GlobalMetadata (Key, Value) VALUES (?1, ?2)")?;
-        for (k, v) in tdf_shape_metadata(shape, n_sigma) {
+        for (k, v) in prov.tdf_pairs() {
             stmt.execute(rusqlite::params![k, v])?;
         }
     }
@@ -230,6 +453,110 @@ pub fn read_tdf_shape(d: impl AsRef<std::path::Path>) -> Result<PeakShape, Box<d
 mod tests {
     use super::*;
     use crate::render::V1_DEFAULT_EMG_K;
+
+    fn realized(rows: &[(u64, f64, f64)]) -> Realized {
+        let mut b = RealizedBuilder::default();
+        for &(pid, s, k) in rows {
+            let shape = if k > 0.0 { PeakShape::emg(k, 3.0).unwrap() } else { PeakShape::Gaussian };
+            b.push(pid, s, &shape);
+        }
+        b.finish()
+    }
+
+    fn per_peptide(rows: &[(u64, f64, f64)]) -> ElutionProvenance {
+        ElutionProvenance::PerPeptide {
+            n_sigma: 3.0,
+            gradient_seconds: 1861.3,
+            cycle_seconds: 0.105445749226364,
+            sigma_band_seconds: (1.134375, 1.890625),
+            k_upper: 10.0,
+            realized: realized(rows),
+        }
+    }
+
+    /// **A per-peptide run must NOT answer "what was the run's kernel?"** — it has no such thing.
+    ///
+    /// The tempting failure is to hand back the population mean. It parses, it constructs, it looks
+    /// exactly like a valid stamp, and it describes a kernel that no peak in the run actually had.
+    /// That is the same self-certifying-wrong-kernel defect this module was written to prevent, and
+    /// it would be introduced BY the module — so `parse_shape` refuses, with a distinct error a
+    /// reader can tell apart from corruption.
+    #[test]
+    fn a_per_peptide_run_has_no_single_shape_to_parse() {
+        let p = per_peptide(&[(1, 12.0, 0.4), (2, 14.0, 0.6)]);
+        let m: HashMap<String, String> = p.pairs().into_iter().collect();
+        assert_eq!(m[KEY_PEAK_SHAPE], "per-peptide");
+
+        // The mean k is 0.5 here — exactly the value a naive implementation would stamp. It must
+        // NOT appear as `emg_k`, because a reader cannot tell a mean from a value.
+        assert!(!m.contains_key(KEY_EMG_K), "per-peptide must not write a single emg_k");
+
+        // And reading it back as "the shape" fails LOUDLY, distinctly from a malformed record: a
+        // reader that sees Malformed reaches for a fallback; one that sees this knows where to look.
+        let got = parse_shape("per-peptide", "0.5", "3.0");
+        assert_eq!(got, Err(ProvenanceError::NotASingleShape));
+        assert!(format!("{}", got.unwrap_err()).contains("per-peptide"));
+    }
+
+    /// The digest must depend on the SET, not on the order it was accumulated in.
+    ///
+    /// The shapes come out of a `HashMap`, whose iteration order is not stable between runs. An
+    /// insertion-order digest would therefore differ between two byte-identical renders — and would
+    /// read as a detected difference, which is worse than no digest at all.
+    #[test]
+    fn the_digest_commits_to_the_set_not_the_insertion_order() {
+        let a = realized(&[(1, 12.0, 0.4), (2, 14.0, 0.6), (3, 9.0, 0.1)]);
+        let b = realized(&[(3, 9.0, 0.1), (1, 12.0, 0.4), (2, 14.0, 0.6)]);
+        assert_eq!(a.digest, b.digest, "digest must be insertion-order independent");
+
+        // But it must still SEE every component: change any one and it moves.
+        assert_ne!(a.digest, realized(&[(1, 12.0, 0.4), (2, 14.0, 0.6), (4, 9.0, 0.1)]).digest, "peptide id");
+        assert_ne!(a.digest, realized(&[(1, 12.5, 0.4), (2, 14.0, 0.6), (3, 9.0, 0.1)]).digest, "sigma");
+        assert_ne!(a.digest, realized(&[(1, 12.0, 0.5), (2, 14.0, 0.6), (3, 9.0, 0.1)]).digest, "k");
+        // ... including a peptide simply being absent, which the aggregates alone can hide.
+        assert_ne!(a.digest, realized(&[(1, 12.0, 0.4), (2, 14.0, 0.6)]).digest, "missing peptide");
+    }
+
+    /// The aggregates are a diagnostic; they must at least be self-consistent.
+    #[test]
+    fn realized_aggregates_are_ordered_and_finite() {
+        let r = realized(&[(1, 12.0, 0.4), (2, 14.0, 0.6), (3, 9.0, 0.0)]);
+        assert_eq!(r.n_shaped, 3);
+        assert_eq!(r.n_gaussian_collapsed, 1, "k=0 is the Gaussian limit and must be counted");
+        assert!(r.sigma_frames_min <= r.sigma_frames_mean && r.sigma_frames_mean <= r.sigma_frames_max);
+        assert!(r.emg_k_min <= r.emg_k_mean && r.emg_k_mean <= r.emg_k_max);
+        for v in [r.sigma_frames_min, r.sigma_frames_mean, r.sigma_frames_max, r.emg_k_min, r.emg_k_mean, r.emg_k_max] {
+            assert!(v.is_finite(), "aggregate {v} is not finite");
+        }
+        // An empty run must not produce inf/NaN aggregates.
+        let e = realized(&[]);
+        assert_eq!(e.n_shaped, 0);
+        for v in [e.sigma_frames_min, e.sigma_frames_mean, e.sigma_frames_max] {
+            assert!(v.is_finite(), "empty-run aggregate {v} is not finite");
+        }
+    }
+
+    /// The two spellings must stay in lockstep — one record, one serialisation.
+    #[test]
+    fn tdf_and_parquet_spellings_carry_the_same_record() {
+        let p = per_peptide(&[(1, 12.0, 0.4)]);
+        let pq = p.pairs();
+        let tdf = p.tdf_pairs();
+        assert_eq!(pq.len(), tdf.len(), "the two spellings must carry the same key count");
+        for ((_, v_pq), (k_tdf, v_tdf)) in pq.iter().zip(tdf.iter()) {
+            assert_eq!(v_pq, v_tdf, "value drift between spellings");
+            assert!(k_tdf.starts_with("Sim"), "tdf key {k_tdf} must be Sim-prefixed");
+        }
+        assert_eq!(tdf[0].0, TDF_KEY_PEAK_SHAPE, "the historical key name must not move");
+
+        // The global record keeps schema v1's three keys EXACTLY, so an old reader still works.
+        let g = ElutionProvenance::Global { shape: PeakShape::emg(0.5, 3.0).unwrap(), n_sigma: 3.0 };
+        let gp = g.pairs();
+        let keys: Vec<&str> = gp.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec![KEY_PEAK_SHAPE, KEY_EMG_K, KEY_N_SIGMA]);
+        let gt: Vec<String> = g.tdf_pairs().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(gt, vec![TDF_KEY_PEAK_SHAPE, TDF_KEY_EMG_K, TDF_KEY_N_SIGMA]);
+    }
 
     /// Every shape the CLI can resolve must survive record → parse as the SAME shape, derived
     /// constants included. `PeakShape: PartialEq` compares `Emg`'s mode offset, tail reach and peak

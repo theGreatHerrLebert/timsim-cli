@@ -613,7 +613,7 @@ fn main() -> Result<()> {
     let gradient_seconds = a.n_frames as f64 * a.cycle_seconds;
     let mut rt: HashMap<u64, (f64, Elution)> = HashMap::new();
     let global_elution = Elution::global(a.sigma_frames, g.shape);
-    let (mut n_shaped, mut n_collapsed) = (0usize, 0usize);
+    let mut realized = timsim_cli::provenance::RealizedBuilder::default();
     for b in timsim_schema::read(&a.peptide_rt, RT::TABLE)? {
         let id: &UInt64Array = b.column_by_name(RT::PEPTIDE_ID).unwrap().as_any().downcast_ref().unwrap();
         let idx: &Float64Array = b.column_by_name(RT::RT_INDEX).unwrap().as_any().downcast_ref().unwrap();
@@ -646,10 +646,10 @@ fn main() -> Result<()> {
                         sig.value(i), kh.value(i), gradient_seconds, a.cycle_seconds, a.n_sigma,
                     )
                     .map_err(|err| anyhow!("peptide {}: {err}", id.value(i)))?;
-                    n_shaped += 1;
-                    if shape == timsim_cli::render::PeakShape::Gaussian {
-                        n_collapsed += 1;
-                    }
+                    // Recorded from the SAME value that reaches the ion, at the point it is
+                    // resolved — not recomputed later from the inputs, which could agree with the
+                    // descriptor while disagreeing with what was rendered.
+                    realized.push(id.value(i), sf, &shape);
                     Elution { sigma_frames: sf, shape }
                 }
                 None => global_elution,
@@ -657,8 +657,10 @@ fn main() -> Result<()> {
             rt.insert(id.value(i), (idx.value(i), e));
         }
     }
-    if a.peak_shape.is_per_peptide() {
+    let prov = if a.peak_shape.is_per_peptide() {
         let (lo_s, hi_s) = timsim_cli::render::rt_sigma_band_seconds(gradient_seconds);
+        let realized = realized.finish();
+        let (n_shaped, n_collapsed) = (realized.n_shaped, realized.n_gaussian_collapsed);
         let mut widths: Vec<f64> = rt.values().map(|(_, e)| e.sigma_frames).collect();
         widths.sort_by(|x, y| x.partial_cmp(y).unwrap());
         eprintln!(
@@ -669,7 +671,18 @@ fn main() -> Result<()> {
         if let (Some(&w0), Some(&w1)) = (widths.first(), widths.last()) {
             eprintln!("  realized sigma_frames: {:.2} .. {:.2} (median {:.2})", w0, w1, widths[widths.len() / 2]);
         }
-    }
+        eprintln!("  realized shape digest: {}", realized.digest);
+        timsim_cli::provenance::ElutionProvenance::PerPeptide {
+            n_sigma: a.n_sigma,
+            gradient_seconds,
+            cycle_seconds: a.cycle_seconds,
+            sigma_band_seconds: (lo_s, hi_s),
+            k_upper: timsim_cli::render::V1_K_UPPER,
+            realized,
+        }
+    } else {
+        timsim_cli::provenance::ElutionProvenance::Global { shape: g.shape, n_sigma: a.n_sigma }
+    };
     // The index -> frame mapping MUST use the artifact's fixed reference range (stamped over the whole
     // peptide space), NOT the min/max of whatever subset is loaded — otherwise the same peptide lands
     // at a different frame depending on `--limit` or which sample is rendered, defeating the whole
@@ -687,10 +700,10 @@ fn main() -> Result<()> {
     let span = (hi - lo).max(1e-9);
 
     if a.dda {
-        return run_dda(&a, &p, &g, &rt, lo, span);
+        return run_dda(&a, &p, &g, &rt, lo, span, &prov);
     }
     if a.dia {
-        return run_dia(&a, &p, &g, &rt, lo, span);
+        return run_dia(&a, &p, &g, &rt, lo, span, &prov);
     }
 
     // ── project: place each ion's materialised MS1 spectrum onto the grid ──────
@@ -813,7 +826,7 @@ fn main() -> Result<()> {
     // could not be identified as stale by anything except re-running the render. See
     // `timsim_cli::provenance`. Stamped after `finalize` because the writer owns the table until it
     // closes the file; it touches `analysis.tdf` only, never `analysis.tdf_bin`.
-    timsim_cli::provenance::stamp_tdf(&a.out, &g.shape, g.n_sigma).map_err(|e| anyhow!("{e}"))?;
+    timsim_cli::provenance::stamp_tdf(&a.out, &prov).map_err(|e| anyhow!("{e}"))?;
     println!(
         "  wrote {} frames, {} MS1 peaks ({} calibration) -> {}",
         a.n_frames, total_peaks,
@@ -1320,7 +1333,7 @@ fn scan_window_dda(scan: i64, g: &Geometry, n_scans: u32) -> (u32, u32) {
 /// DDA-PASEF render — MS1 surveys + top-N selection (`timsim_cli::dda`) + band-limited MS2, plus a sidecar
 /// answer key tying each selection event to the true precursor. Oracle-isolation baseline: clean single
 /// target per band; in-window co-isolation contaminants (and DDA memory streaming) are follow-ups.
-fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64) -> Result<()> {
+fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64, prov: &timsim_cli::provenance::ElutionProvenance) -> Result<()> {
     use ms_io::data::tdf_writer::{DdaPasefWindow, DdaPrecursor, TdfWriter, TdfWriterConfig};
     use timsim_cli::dda::{schedule, Candidate, SelectionParams};
     use timsim_cli::render::{elution_frac, gauss_frac};
@@ -1531,7 +1544,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
     // could not be identified as stale by anything except re-running the render. See
     // `timsim_cli::provenance`. Stamped after `finalize` because the writer owns the table until it
     // closes the file; it touches `analysis.tdf` only, never `analysis.tdf_bin`.
-    timsim_cli::provenance::stamp_tdf(&a.out, &g.shape, g.n_sigma).map_err(|e| anyhow!("{e}"))?;
+    timsim_cli::provenance::stamp_tdf(&a.out, &prov).map_err(|e| anyhow!("{e}"))?;
 
     // Sidecar answer key: one row per selection EVENT, keyed on (ms2_frame, scan_begin).
     {
@@ -1568,7 +1581,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             Field::new("event_intensity", DataType::Float64, false),
             Field::new("rt_seconds", DataType::Float64, false),
         ],
-            timsim_cli::provenance::schema_metadata(&g.shape, g.n_sigma),
+            prov.schema_metadata(),
         ));
         let batch = RecordBatch::try_new(schema.clone(), vec![
             Arc::new(Int64Array::from(fr)), Arc::new(Int64Array::from(sb)), Arc::new(Int64Array::from(se)),
@@ -1587,7 +1600,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
 }
 
 /// DIA render: MS1+MS2 frames on the reference's cycle, fragments gated by the diagonal transmission.
-fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64) -> Result<()> {
+fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64, prov: &timsim_cli::provenance::ElutionProvenance) -> Result<()> {
     use timsim_cli::dia::DiaSchedule;
     use timsim_cli::ms2::{active_frames, dia_render_range, DiaIon};
 
@@ -2044,7 +2057,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
     // could not be identified as stale by anything except re-running the render. See
     // `timsim_cli::provenance`. Stamped after `finalize` because the writer owns the table until it
     // closes the file; it touches `analysis.tdf` only, never `analysis.tdf_bin`.
-    timsim_cli::provenance::stamp_tdf(&a.out, &g.shape, g.n_sigma).map_err(|e| anyhow!("{e}"))?;
+    timsim_cli::provenance::stamp_tdf(&a.out, &prov).map_err(|e| anyhow!("{e}"))?;
     println!("  wrote {} frames ({} MS1 + {} MS2 peaks) -> {}", a.n_frames, ms1_peaks, ms2_peaks, a.out.display());
 
     // Answer key: per-precursor DIA truth, the SAME 8-column schema render_thermo writes — so the eval
@@ -2095,7 +2108,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elutio
             Field::new("has_ms2", DataType::Boolean, false),
             Field::new("in_any_window", DataType::Boolean, false),
         ],
-            timsim_cli::provenance::schema_metadata(&g.shape, g.n_sigma),
+            prov.schema_metadata(),
         ));
         let batch = RecordBatch::try_new(schema.clone(), vec![
             Arc::new(U64::from(pc)), Arc::new(U64::from(pe)), Arc::new(Int64Array::from(ch)),

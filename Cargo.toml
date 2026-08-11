@@ -29,6 +29,10 @@ name = "timsim-yield"
 path = "src/bin/yield.rs"
 
 [dependencies]
+# The realized-shape digest in `src/provenance.rs` commits the render to the shapes it actually
+# produced, so this is needed at RENDER time, not only by the golden test. Already in the lock via
+# the TDF stack, so it pulls nothing new.
+sha2 = "0.10"
 # The chemistry core and the schema contract. 0.2.0 adds per-protein `regulate` magnitudes,
 # regulated-implies-present forcing, and the `requested_log2fc` column. Working on them and this
 # repo at the same time? Put a [patch.crates-io] in a git-ignored `.cargo/config.toml` here — never
@@ -126,7 +130,3 @@ path = "src/bin/spectra.rs"
 required-features = ["tdf"]
 
 [dev-dependencies]
-# The Gaussian golden (`tests/golden_gaussian.rs`) hashes real `.d` / `.raw` / mzML output against
-# artifacts produced by the pre-EMG commit. Already in the lock via the TDF stack, so this pulls
-# nothing new.
-sha2 = "0.10"
