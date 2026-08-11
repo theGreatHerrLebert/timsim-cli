@@ -107,6 +107,14 @@ pub const KEY_N_SHAPED: &str = "n_peptides_shaped";
 pub const KEY_N_COLLAPSED: &str = "n_gaussian_collapsed";
 pub const KEY_SIGMA_STATS: &str = "sigma_frames_min_mean_max";
 pub const KEY_K_STATS: &str = "emg_k_min_mean_max";
+/// The mobility-width model: target, the model-specific reference it is calibrated against, and the
+/// resulting gain.
+///
+/// Stamped rather than left as a compiled constant because the reference is tied to a particular CCS
+/// model. A retrained model, a different instrument domain or an unusually charge-skewed proteome can
+/// make the population mean miss the target, and an artifact that does not record which reference it
+/// used cannot be checked for that after the fact.
+pub const KEY_MOBILITY: &str = "mobility_width_model";
 
 /// What actually came out of a per-peptide run.
 ///
@@ -206,6 +214,9 @@ pub enum ElutionProvenance {
         sigma_band_seconds: (f64, f64),
         k_upper: f64,
         realized: Realized,
+        /// `(target, model reference)` in `1/K0` for the per-ion mobility width; `None` when
+        /// per-ion widths are off and every ion used the flat `--sigma-scans`.
+        mobility: Option<(f64, f64)>,
     },
 }
 
@@ -229,6 +240,7 @@ impl ElutionProvenance {
             }
             ElutionProvenance::PerPeptide {
                 n_sigma, gradient_seconds, cycle_seconds, sigma_band_seconds, k_upper, realized,
+                mobility,
             } => {
                 v.push((KEY_N_SIGMA.to_string(), f64_str(*n_sigma)));
                 v.push((KEY_SCHEMA_VERSION.to_string(), PROVENANCE_SCHEMA_VERSION.to_string()));
@@ -247,6 +259,11 @@ impl ElutionProvenance {
                 v.push((KEY_N_COLLAPSED.to_string(), realized.n_gaussian_collapsed.to_string()));
                 v.push((KEY_SIGMA_STATS.to_string(), format!("{}/{}/{}",
                     f64_str(realized.sigma_frames_min), f64_str(realized.sigma_frames_mean), f64_str(realized.sigma_frames_max))));
+                v.push((KEY_MOBILITY.to_string(), match mobility {
+                    Some((t, r)) => format!("per-ion/ccs_std target={} reference={} gain={}",
+                        f64_str(*t), f64_str(*r), f64_str(t / r)),
+                    None => "flat/sigma-scans".to_string(),
+                }));
                 v.push((KEY_K_STATS.to_string(), format!("{}/{}/{}",
                     f64_str(realized.emg_k_min), f64_str(realized.emg_k_mean), f64_str(realized.emg_k_max))));
             }
@@ -485,6 +502,7 @@ mod tests {
             sigma_band_seconds: (1.134375, 1.890625),
             k_upper: 10.0,
             realized: realized(rows),
+            mobility: Some((0.009, 0.009197)),
         }
     }
 

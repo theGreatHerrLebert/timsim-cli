@@ -761,6 +761,8 @@ fn main() -> Result<()> {
             sigma_band_seconds: (lo_s, hi_s),
             k_upper: timsim_cli::render::V1_K_UPPER,
             realized,
+            mobility: (a.mobility_std_target > 0.0)
+                .then_some((a.mobility_std_target, timsim_cli::render::CCS_STD_MODEL_REFERENCE)),
         }
     } else {
         timsim_cli::provenance::ElutionProvenance::Global { shape: g.shape, n_sigma: a.n_sigma }
@@ -1392,7 +1394,9 @@ fn place_scan(
     p: &Placement,
     mob: &MobilityWidth,
 ) -> (f64, f64) {
-    let entry = ccs.get(&pcid);
+    // A non-finite or non-positive CCS is not a mobility: Mason-Schamp would hand back garbage and
+    // the ion would silently land at scan 0 with a fallback width, looking like a real placement.
+    let entry = ccs.get(&pcid).filter(|(c, _)| c.is_finite() && *c > 0.0);
     let one_over_k0 = match entry {
         Some(&(c, _)) => ccs_to_one_over_reduced_mobility(c, mz, charge, MASS_GAS, TEMP, T_DIFF),
         None => {
@@ -1400,7 +1404,11 @@ fn place_scan(
             p.im_min + (p.im_max - p.im_min) * f
         }
     };
-    let scan = (p.to_scan)(one_over_k0.clamp(p.im_min, p.im_max)).min(p.n_scans - 1);
+    // ONE mobility for both the centre and the width. Deriving the width from the unclamped value
+    // while placing the centre at the clamped one gives an out-of-band ion a peak whose width comes
+    // from a mobility it was never rendered at.
+    let placed_k0 = one_over_k0.clamp(p.im_min, p.im_max);
+    let scan = (p.to_scan)(placed_k0).min(p.n_scans - 1);
     // The scan<->1/K0 map is NONLINEAR (Bruker ModelType-2), so a width in 1/K0 is a different
     // number of scans at each end of the ramp. Take the local slope from the calibration itself,
     // one scan either side of where this ion actually lands.
@@ -1413,7 +1421,7 @@ fn place_scan(
                 return None;
             }
             let slope = ((p.to_k0)(hi) - (p.to_k0)(lo)) / (hi - lo) as f64;
-            timsim_cli::render::mobility_sigma_scans(c, sd, one_over_k0, slope, mob.target, mob.reference)
+            timsim_cli::render::mobility_sigma_scans(c, sd, placed_k0, slope, mob.target, mob.reference)
         })
         .unwrap_or(mob.fallback_sigma_scans);
     (scan as f64, sigma)
