@@ -33,7 +33,7 @@ use ms_io::data::handle::{
 use ms_io::data::meta::{read_global_meta_sql, read_meta_data_sql, read_mz_calibration, read_tims_calibration};
 use ms_io::data::tdf_writer::{RenderedFrame, TdfWriter, TdfWriterConfig};
 use ms_io::data::utility::flatten_scan_values;
-use timsim_cli::render::{stream_render_flat, Geometry, Ion};
+use timsim_cli::render::{stream_render_flat, Elution, Geometry, Ion};
 use timsim_schema::tables::{peptide_rt as RT, precursors as PRE};
 
 #[derive(Parser)]
@@ -95,7 +95,7 @@ struct Args {
     ///
     /// !!! This default is INVISIBLE to necroflow's command-string fingerprint: a render cached
     /// before this flag existed was made with `gaussian` and will NOT be rebuilt. See PEAK_SHAPE.md.
-    #[arg(long, value_enum, default_value_t = PeakShapeArg::Emg)]
+    #[arg(long, value_enum, default_value_t = PeakShapeArg::PerPeptide)]
     peak_shape: PeakShapeArg,
     /// EMG tailing factor `k = 1 / (sigma * lambda)` — the tail time constant in units of sigma.
     /// `0` is the Gaussian limit; larger is more tailed. Ignored unless `--peak-shape emg`.
@@ -429,8 +429,20 @@ fn build_placement(a: &Args) -> Result<Placement> {
 enum PeakShapeArg {
     /// Symmetric Gaussian — v2's historical shape. Bit-identical to the pre-EMG binary.
     Gaussian,
-    /// v1's exponentially modified Gaussian (tailed).
+    /// v1's exponentially modified Gaussian, ONE `--emg-k` and `--sigma-frames` for the whole run.
     Emg,
+    /// v1's EMG with a PER-PEPTIDE width and tail, read from `peptide_rt` (the DEFAULT).
+    ///
+    /// This is what v1 actually does: it draws `sigma ~ Beta(4,4)` scaled into a gradient-derived
+    /// band and `k ~ Beta(1,20)*10` per peptide, so no two peptides share a peak shape. `emg` above
+    /// matches only the MEAN of that population — every peak identical — which is a materially
+    /// easier and less realistic problem for a search engine than the one v1 poses.
+    ///
+    /// Requires `rt_sigma_hat`/`rt_k_hat` in `peptide_rt`. Their ABSENCE is an error, not a
+    /// fallback: silently reverting to a global shape would turn an incompatible upstream artifact
+    /// into a plausible-but-different simulation, which is the failure this render's provenance
+    /// exists to make visible.
+    PerPeptide,
 }
 
 impl PeakShapeArg {
@@ -440,7 +452,15 @@ impl PeakShapeArg {
         Ok(match self {
             PeakShapeArg::Gaussian => timsim_cli::render::PeakShape::Gaussian,
             PeakShapeArg::Emg => timsim_cli::render::PeakShape::emg(emg_k, n_sigma)?,
+            // The run-wide fallback for the per-peptide mode: used only where a peptide has no draw
+            // (the non-Bruker writers, which do not read `peptide_rt`). Per-peptide ions carry their
+            // own shape and never consult this one.
+            PeakShapeArg::PerPeptide => timsim_cli::render::PeakShape::emg(emg_k, n_sigma)?,
         })
+    }
+
+    fn is_per_peptide(self) -> bool {
+        matches!(self, PeakShapeArg::PerPeptide)
     }
 }
 
@@ -582,15 +602,72 @@ fn main() -> Result<()> {
         shape: a.peak_shape.resolve(a.emg_k, a.n_sigma)?,
     };
 
-    // peptide_id -> rt_index.
-    let mut rt: HashMap<u64, f64> = HashMap::new();
+    // peptide_id -> (rt_index, that peptide's own elution peak).
+    //
+    // The gradient the width law needs is this run's own span, now that the clock is inherited from
+    // the reference rather than assumed to be 0.1 s/frame. Note this is a DELIBERATE improvement on
+    // v1, which feeds the sigma formula its CONFIG's declared `gradient_length` and never consults
+    // the reference (`acquisition.py:177-184` takes only the cycle length) — so v1 computed widths
+    // for a 1860.0 s gradient while acquiring over 1861.3 s. Worth 0.00027 s of sigma, i.e. nothing
+    // numerically, but it is a difference in kind and is recorded as such rather than as parity.
+    let gradient_seconds = a.n_frames as f64 * a.cycle_seconds;
+    let mut rt: HashMap<u64, (f64, Elution)> = HashMap::new();
+    let global_elution = Elution::global(a.sigma_frames, g.shape);
+    let (mut n_shaped, mut n_collapsed) = (0usize, 0usize);
     for b in timsim_schema::read(&a.peptide_rt, RT::TABLE)? {
         let id: &UInt64Array = b.column_by_name(RT::PEPTIDE_ID).unwrap().as_any().downcast_ref().unwrap();
         let idx: &Float64Array = b.column_by_name(RT::RT_INDEX).unwrap().as_any().downcast_ref().unwrap();
+        // Refuse rather than fall back: an artifact predating these columns must not be rendered as
+        // though it were a global-shape run, because the output would be indistinguishable from one
+        // that had the draws and be a different simulation.
+        let draws = if a.peak_shape.is_per_peptide() {
+            let sig = b.column_by_name(RT::SIGMA_HAT).ok_or_else(|| anyhow!(
+                "--peak-shape per-peptide needs `{}` in peptide_rt, and this artifact predates it. \
+                 Re-run timsim-rt, or pass --peak-shape emg for a single run-wide shape.", RT::SIGMA_HAT
+            ))?;
+            let kh = b.column_by_name(RT::K_HAT).ok_or_else(|| anyhow!(
+                "--peak-shape per-peptide needs `{}` in peptide_rt; re-run timsim-rt.", RT::K_HAT
+            ))?;
+            let sig: &Float64Array = sig.as_any().downcast_ref()
+                .ok_or_else(|| anyhow!("{} is not float64", RT::SIGMA_HAT))?;
+            let kh: &Float64Array = kh.as_any().downcast_ref()
+                .ok_or_else(|| anyhow!("{} is not float64", RT::K_HAT))?;
+            Some((sig, kh))
+        } else {
+            None
+        };
         for i in 0..b.num_rows() {
-            if Array::is_valid(idx, i) {
-                rt.insert(id.value(i), idx.value(i));
+            if !Array::is_valid(idx, i) {
+                continue;
             }
+            let e = match draws {
+                Some((sig, kh)) => {
+                    let (sf, shape) = timsim_cli::render::rt_shape_for_peptide(
+                        sig.value(i), kh.value(i), gradient_seconds, a.cycle_seconds, a.n_sigma,
+                    )
+                    .map_err(|err| anyhow!("peptide {}: {err}", id.value(i)))?;
+                    n_shaped += 1;
+                    if shape == timsim_cli::render::PeakShape::Gaussian {
+                        n_collapsed += 1;
+                    }
+                    Elution { sigma_frames: sf, shape }
+                }
+                None => global_elution,
+            };
+            rt.insert(id.value(i), (idx.value(i), e));
+        }
+    }
+    if a.peak_shape.is_per_peptide() {
+        let (lo_s, hi_s) = timsim_cli::render::rt_sigma_band_seconds(gradient_seconds);
+        let mut widths: Vec<f64> = rt.values().map(|(_, e)| e.sigma_frames).collect();
+        widths.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        eprintln!(
+            "  elution = per-peptide over a {:.1} s gradient: sigma band [{:.3}, {:.3}] s \
+             = [{:.2}, {:.2}] frames, {n_shaped} peptides shaped ({n_collapsed} drew k=0 -> Gaussian)",
+            gradient_seconds, lo_s, hi_s, lo_s / a.cycle_seconds, hi_s / a.cycle_seconds,
+        );
+        if let (Some(&w0), Some(&w1)) = (widths.first(), widths.last()) {
+            eprintln!("  realized sigma_frames: {:.2} .. {:.2} (median {:.2})", w0, w1, widths[widths.len() / 2]);
         }
     }
     // The index -> frame mapping MUST use the artifact's fixed reference range (stamped over the whole
@@ -654,7 +731,7 @@ fn main() -> Result<()> {
         let mff: &Float32Array = b.column_by_name(PRE::MODFORM_FRACTION).unwrap().as_any().downcast_ref().unwrap();
         for i in 0..b.num_rows() {
             let Some(spec) = ms1.get(&pcid.value(i)) else { continue }; // no materialised spectrum
-            let Some(&rt_index) = rt.get(&pid.value(i)) else { continue };
+            let Some(&(rt_index, elution)) = rt.get(&pid.value(i)) else { continue };
             // Map the index range onto the LAST valid 0-based frame (n_frames - 1); scaling by n_frames
             // puts index_max one frame past the end (and disagrees with the DIA path).
             let apex_frame = (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
@@ -678,7 +755,7 @@ fn main() -> Result<()> {
             }
             let amount = amounts.get(&pid.value(i)).copied().unwrap_or(1.0);
             let abundance = amount * ionz.value(i) as f64 * mff.value(i) as f64 * frac.value(i) as f64;
-            ions.push(Ion { apex_frame, scan_center: scan as f64, abundance, peaks });
+            ions.push(Ion { apex_frame, scan_center: scan as f64, abundance, peaks, elution });
             if a.limit > 0 && ions.len() >= a.limit {
                 break 'outer;
             }
@@ -1243,7 +1320,7 @@ fn scan_window_dda(scan: i64, g: &Geometry, n_scans: u32) -> (u32, u32) {
 /// DDA-PASEF render — MS1 surveys + top-N selection (`timsim_cli::dda`) + band-limited MS2, plus a sidecar
 /// answer key tying each selection event to the true precursor. Oracle-isolation baseline: clean single
 /// target per band; in-window co-isolation contaminants (and DDA memory streaming) are follow-ups.
-fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f64, span: f64) -> Result<()> {
+fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64) -> Result<()> {
     use ms_io::data::tdf_writer::{DdaPasefWindow, DdaPrecursor, TdfWriter, TdfWriterConfig};
     use timsim_cli::dda::{schedule, Candidate, SelectionParams};
     use timsim_cli::render::{elution_frac, gauss_frac};
@@ -1274,7 +1351,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         }
     }
 
-    struct DdaIon { peptide_id: u64, apex_frame: f64, scan: i64, abundance: f64, ms1: Vec<(u32, f32)>, ms2: Vec<(u32, f32)> }
+    struct DdaIon { peptide_id: u64, apex_frame: f64, scan: i64, abundance: f64, ms1: Vec<(u32, f32)>, ms2: Vec<(u32, f32)>, elution: Elution }
     let mut ions: HashMap<u64, DdaIon> = HashMap::new();
     let mut cands: Vec<Candidate> = Vec::new();
     let mut order: u32 = 0;
@@ -1288,7 +1365,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         let ionz: &Float32Array = b.column_by_name(PRE::IONIZATION_PROPENSITY).unwrap().as_any().downcast_ref().unwrap();
         let mff: &Float32Array = b.column_by_name(PRE::MODFORM_FRACTION).unwrap().as_any().downcast_ref().unwrap();
         for i in 0..b.num_rows() {
-            let Some(&rt_index) = rt.get(&pid.value(i)) else { continue };
+            let Some(&(rt_index, elution)) = rt.get(&pid.value(i)) else { continue };
             let Some(ms1raw) = ms1_raw.remove(&pcid.value(i)) else { continue };
             let apex_frame = 1.0 + (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
             let scan = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p) as i64;
@@ -1307,7 +1384,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                     sigma_frames: g.sigma_frames, n_sigma: g.n_sigma, shape: g.shape,
                 });
             }
-            ions.insert(pcid.value(i), DdaIon { peptide_id: pid.value(i), apex_frame, scan, abundance, ms1, ms2 });
+            ions.insert(pcid.value(i), DdaIon { peptide_id: pid.value(i), apex_frame, scan, abundance, ms1, ms2, elution });
             order += 1;
             if a.limit > 0 && ions.len() >= a.limit { break 'outer; }
         }
@@ -1339,7 +1416,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
 
     // Active-set sweep over ions by apex frame, for the MS1 survey deposition.
     let win: Vec<(u32, u32, u64)> = ions.iter().map(|(&id, io)| {
-        let (left, right) = timsim_cli::render::elution_half_widths(g.sigma_frames, g.n_sigma, &g.shape);
+        let (left, right) = io.elution.half_widths(g.n_sigma);
         ((io.apex_frame - left).max(1.0) as u32, ((io.apex_frame + right) as u32).min(a.n_frames), id)
     }).collect();
     let mut order_start: Vec<usize> = (0..win.len()).collect();
@@ -1392,7 +1469,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 if is_ms1 {
                     for &i in &active {
                         let io = &ions[&win[i].2];
-                        let ew = elution_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames, &g.shape);
+                        let ew = io.elution.frac(f - 0.5, f + 0.5, io.apex_frame);
                         if ew <= 0.0 { continue; }
                         let (slo, shi) = scan_window_dda(io.scan, g, n_scans);
                         for scan in slo..=shi {
@@ -1405,7 +1482,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 } else if let Some(evs) = events_by_frame.get(&(frame as i64)) {
                     for e in evs {
                         let io = &ions[&e.precursor_id];
-                        let ew = elution_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames, &g.shape);
+                        let ew = io.elution.frac(f - 0.5, f + 0.5, io.apex_frame);
                         if ew <= 0.0 { continue; }
                         let s0 = e.scan_begin.max(0) as u32;
                         let s1 = (e.scan_end.min(n_scans as i64 - 1)).max(0) as u32;
@@ -1510,7 +1587,7 @@ fn run_dda(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
 }
 
 /// DIA render: MS1+MS2 frames on the reference's cycle, fragments gated by the diagonal transmission.
-fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f64, span: f64) -> Result<()> {
+fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, (f64, Elution)>, lo: f64, span: f64) -> Result<()> {
     use timsim_cli::dia::DiaSchedule;
     use timsim_cli::ms2::{active_frames, dia_render_range, DiaIon};
 
@@ -1608,6 +1685,8 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         // Identity, carried through for the answer key (`--truth`) — the render itself doesn't need them.
         peptide_id: u64,
         charge: i64,
+        /// THIS ion's chromatographic peak — see [`timsim_cli::render::Ion::elution`].
+        elution: Elution,
     }
     let mut meta: HashMap<u64, IonMeta> = HashMap::new();
     let mut order: u32 = 0;
@@ -1621,7 +1700,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         let ionz: &Float32Array = b.column_by_name(PRE::IONIZATION_PROPENSITY).unwrap().as_any().downcast_ref().unwrap();
         let mff: &Float32Array = b.column_by_name(PRE::MODFORM_FRACTION).unwrap().as_any().downcast_ref().unwrap();
         for i in 0..b.num_rows() {
-            let Some(&rt_index) = rt.get(&pid.value(i)) else { continue };
+            let Some(&(rt_index, elution)) = rt.get(&pid.value(i)) else { continue };
             // 1-based apex frame (the DIA schedule + Frames.Id are 1-based).
             let apex_frame = 1.0 + (rt_index - lo) / span * (a.n_frames as f64 - 1.0);
             let scan = place_scan(pcid.value(i), mz.value(i), chg.value(i).max(1) as u32, &ccs, p);
@@ -1638,7 +1717,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                 pcid.value(i),
                 IonMeta {
                     apex_frame, scan, abundance, precursor_mz: mz.value(i), survival, order,
-                    peptide_id: pid.value(i), charge: chg.value(i).max(1) as i64,
+                    peptide_id: pid.value(i), charge: chg.value(i).max(1) as i64, elution,
                 },
             );
             order += 1;
@@ -1668,7 +1747,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
     // bounds[0]=1 .. bounds[n_chunks]=n_frames+1, NON-decreasing (the clamp can repeat a value, which just
     // yields an empty range, handled below); chunk c renders [bounds[c], bounds[c+1]-1].
     let bounds: Vec<u32> = {
-        let mut starts: Vec<u32> = meta.values().map(|m| active_frames(m.apex_frame, g).0).collect();
+        let mut starts: Vec<u32> = meta.values().map(|m| active_frames(m.apex_frame, &m.elution, g).0).collect();
         starts.sort_unstable();
         let mut bounds: Vec<u32> = Vec::with_capacity(n_chunks as usize + 1);
         bounds.push(1);
@@ -1764,6 +1843,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             Some((m.order, DiaIon {
                 apex_frame: m.apex_frame, scan_center: m.scan, abundance: m.abundance,
                 precursor_mz: m.precursor_mz, ms1_peaks: m1, ms2_peaks: m2, survival: m.survival,
+                elution: m.elution,
             }))
         }).collect();
         ions.sort_unstable_by_key(|x| x.0);
@@ -1772,7 +1852,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
         // 2) Fine frame-chunks (threads*8) at equal-ion quantiles, for load-balance + work-stealing.
         let pn = ((rayon::current_num_threads() * 8) as u32).clamp(1, a.n_frames.max(1));
         let pbounds: Vec<u32> = {
-            let mut starts: Vec<u32> = ions.iter().map(|io| active_frames(io.apex_frame, g).0).collect();
+            let mut starts: Vec<u32> = ions.iter().map(|io| active_frames(io.apex_frame, &io.elution, g).0).collect();
             starts.sort_unstable();
             let mut bnds = Vec::with_capacity(pn as usize + 1);
             bnds.push(1u32);
@@ -1802,7 +1882,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             if fc1 < fc0 { return Ok((Vec::new(), 0, 0)); }
             // Ions active anywhere in [fc0, fc1] (inclusive overlap), preserving global order.
             let subset: Vec<DiaIon> = ions.iter()
-                .filter(|io| { let (fs, fe) = active_frames(io.apex_frame, g); fe >= fc0 && fs <= fc1 })
+                .filter(|io| { let (fs, fe) = active_frames(io.apex_frame, &io.elution, g); fe >= fc0 && fs <= fc1 })
                 .cloned().collect();
             let (mut c1, mut c2) = (0u64, 0u64);
             let mut out: Vec<(u32, u8, ms_io::data::tdf_writer::EncodedBlock)> = Vec::new();
@@ -1859,7 +1939,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
             for i in 0..b.num_rows() {
                 let pc = pcid.value(i);
                 let Some(m) = meta.get(&pc) else { continue };
-                let (fs, fe) = active_frames(m.apex_frame, g);
+                let (fs, fe) = active_frames(m.apex_frame, &m.elution, g);
                 if fe < fc0 || fs > fc1 {
                     continue; // not active anywhere in this chunk's frame range
                 }
@@ -1898,6 +1978,7 @@ fn run_dia(a: &Args, p: &Placement, g: &Geometry, rt: &HashMap<u64, f64>, lo: f6
                         ms1_peaks: ms1p,
                         ms2_peaks: ms2p,
                         survival: m.survival,
+                        elution: m.elution,
                     },
                 ))
             })
@@ -2088,7 +2169,7 @@ fn render_range_parallel(
     let pbounds: Vec<u32> = {
         let mut starts: Vec<u32> = ions
             .iter()
-            .map(|io| active_frames(io.apex_frame, g).0.max(frame_lo))
+            .map(|io| active_frames(io.apex_frame, &io.elution, g).0.max(frame_lo))
             .collect();
         starts.sort_unstable();
         let mut b = Vec::with_capacity(pn as usize + 1);

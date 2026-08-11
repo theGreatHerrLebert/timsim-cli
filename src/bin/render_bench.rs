@@ -446,6 +446,10 @@ fn main() -> Result<()> {
                 scan_center,
                 abundance: frac.value(i) as f64, // unit peptide amount × charge_fraction
                 peaks,
+                // The bench measures THROUGHPUT, not realism, so every ion shares the run-wide peak:
+                // per-peptide widths would make the active-set size vary between ions and turn a
+                // throughput number into a function of the draw. Held constant deliberately.
+                elution: timsim_cli::render::Elution::global(g.sigma_frames, g.shape),
             });
             if a.limit > 0 && ions.len() >= a.limit {
                 break 'outer;

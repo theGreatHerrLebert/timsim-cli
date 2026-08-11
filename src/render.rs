@@ -30,10 +30,50 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap};
 /// The acquisition geometry a render needs: the frame/scan grid and the peak widths (as Gaussian
 /// sigmas in frame/scan units) with a truncation radius. This is the render-time image of the
 /// portable `[0,1]` elution/mobility shapes — the gradient/ramp mapping happens upstream.
+/// One peptide's chromatographic peak: its width and its kernel, travelling together.
+///
+/// These two are a PAIR — a width without its shape is not a peak, and every call site that
+/// integrates the elution profile needs both. Bundling them means adding per-peptide shape to an ion
+/// is one field rather than two that can drift apart, and it makes the "which sigma goes with which
+/// shape" question unaskable.
+///
+/// `Copy` and 40 bytes, so carrying one per ion costs ~360 MB at 9M ions against a render whose
+/// resident cost is already ~6 KB/precursor — i.e. nothing. The expensive part is CONSTRUCTION
+/// (`Emg::new` runs a ~160-iteration solve, measured at 13.7 us), which is why these are built once
+/// per PEPTIDE at load and then copied onto that peptide's ions, never rebuilt per ion or per frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Elution {
+    pub sigma_frames: f64,
+    pub shape: PeakShape,
+}
+
+impl Elution {
+    /// The run-wide fallback: one width and one kernel for everything, as before per-peptide draws.
+    pub fn global(sigma_frames: f64, shape: PeakShape) -> Self {
+        Self { sigma_frames, shape }
+    }
+
+    /// Truncation half-widths `(left, right)` around this peak's apex, in frames.
+    #[inline]
+    pub fn half_widths(&self, n_sigma: f64) -> (f64, f64) {
+        elution_half_widths(self.sigma_frames, n_sigma, &self.shape)
+    }
+
+    /// The fraction of this peak's mass falling in `[a, b]` (frame units).
+    #[inline]
+    pub fn frac(&self, a: f64, b: f64, apex: f64) -> f64 {
+        elution_frac(a, b, apex, self.sigma_frames, &self.shape)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub n_frames: u32,
     pub n_scans: u32,
+    /// The run-wide DEFAULT elution width, used only where a peptide has no draw of its own.
+    ///
+    /// Per-peptide widths live on the ion ([`Elution`]); this stays as the fallback for the global
+    /// mode (`--emg-k` explicitly set) and for the non-Bruker writers that do not read `peptide_rt`.
     pub sigma_frames: f64,
     pub sigma_scans: f64,
     /// Truncate each peak at this many sigma (the `target_p` analog).
@@ -694,6 +734,13 @@ pub struct Ion {
     pub scan_center: f64,
     pub abundance: f64,
     pub peaks: Vec<(u32, f32)>,
+    /// THIS ion's chromatographic peak — its own width and kernel.
+    ///
+    /// v1 draws both per peptide, so no two peptides share a peak shape. Reading them off
+    /// [`Geometry`] instead, as this render used to, gives every peak in the run an identical
+    /// profile: a materially easier and less realistic problem for a search engine than v1 poses.
+    /// Ions of the same peptide share one value; it is built once at load, never per frame.
+    pub elution: Elution,
 }
 
 /// erf via Abramowitz-Stegun 7.1.26 (max error ~1.5e-7). The two renders share this, so its error
@@ -729,10 +776,13 @@ pub fn gauss_frac(a: f64, b: f64, mean: f64, sigma: f64) -> f64 {
 /// (`sigma_frames`≈12, `sigma_scans`≈6, many bins across the peak) and it does NOT distort the
 /// precursor↔fragment ratio (MS1 and MS2 share these weights), but if sub-bin peaks are ever needed,
 /// select bins whose *intervals* overlap the support and renormalise. Same caveat in [`scan_window`].
-fn active_window(apex_frame: f64, g: &Geometry) -> (u32, u32) {
-    let (left, right) = elution_half_widths(g.sigma_frames, g.n_sigma, &g.shape);
-    let start = (apex_frame - left).max(0.0) as u32;
-    let end = ((apex_frame + right) as u32).min(g.n_frames - 1);
+fn active_window(io: &Ion, g: &Geometry) -> (u32, u32) {
+    // The half-widths come from THIS ion's own peak, not the run's. Under per-peptide shapes the
+    // window is what bounds the sweep's active set, so a global width here would either truncate
+    // wide peptides or keep narrow ones resident far past their support.
+    let (left, right) = io.elution.half_widths(g.n_sigma);
+    let start = (io.apex_frame - left).max(0.0) as u32;
+    let end = ((io.apex_frame + right) as u32).min(g.n_frames - 1);
     (start, end)
 }
 
@@ -777,7 +827,7 @@ pub fn stream_render_range<F: FnMut(FrameEmission)>(
     if g.n_frames == 0 || g.n_scans == 0 {
         return;
     }
-    let windows: Vec<(u32, u32)> = ions.iter().map(|io| active_window(io.apex_frame, g)).collect();
+    let windows: Vec<(u32, u32)> = ions.iter().map(|io| active_window(io, g)).collect();
 
     // Enter in frame_start order; sort indices, not the data (§3.6).
     let mut order: Vec<usize> = (0..ions.len()).collect();
@@ -807,7 +857,7 @@ pub fn stream_render_range<F: FnMut(FrameEmission)>(
         let f = frame as f64;
         for &Reverse((_, idx)) in active.iter() {
             let io = &ions[idx];
-            let ew = elution_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames, &g.shape);
+            let ew = io.elution.frac(f - 0.5, f + 0.5, io.apex_frame);
             if ew <= 0.0 {
                 continue;
             }
@@ -863,7 +913,7 @@ pub fn stream_render_flat_range<F: FnMut(FlatEmission)>(
     if g.n_frames == 0 || g.n_scans == 0 {
         return;
     }
-    let windows: Vec<(u32, u32)> = ions.iter().map(|io| active_window(io.apex_frame, g)).collect();
+    let windows: Vec<(u32, u32)> = ions.iter().map(|io| active_window(io, g)).collect();
     let mut order: Vec<usize> = (0..ions.len()).collect();
     order.sort_unstable_by_key(|&i| windows[i].0);
 
@@ -890,7 +940,7 @@ pub fn stream_render_flat_range<F: FnMut(FlatEmission)>(
         let f = frame as f64;
         for &Reverse((_, idx)) in active.iter() {
             let io = &ions[idx];
-            let ew = elution_frac(f - 0.5, f + 0.5, io.apex_frame, g.sigma_frames, &g.shape);
+            let ew = io.elution.frac(f - 0.5, f + 0.5, io.apex_frame);
             if ew <= 0.0 {
                 continue;
             }
@@ -937,7 +987,6 @@ pub fn sweep_render(ions: &[Ion], g: &Geometry) -> BTreeMap<(u32, u32, u32), f64
 /// sweep — never on a real run.
 pub fn reference_render(ions: &[Ion], g: &Geometry) -> BTreeMap<(u32, u32, u32), f64> {
     let mut out: BTreeMap<(u32, u32, u32), f64> = BTreeMap::new();
-    let (fleft, fright) = elution_half_widths(g.sigma_frames, g.n_sigma, &g.shape);
     let shalf = g.n_sigma * g.sigma_scans;
     let last_frame = (g.n_frames - 1) as f64;
     let last_scan = (g.n_scans - 1) as f64;
@@ -946,13 +995,17 @@ pub fn reference_render(ions: &[Ion], g: &Geometry) -> BTreeMap<(u32, u32, u32),
         // Independent window derivation: clamp on the reals, then floor — a different code path from
         // active_window's truncate-then-clamp. For non-negative values the two agree, so any
         // divergence signals a real off-by-one in one of them, which is exactly what we want to see.
+        // Per-ion, like the sweep — but still derived independently: this clamps on the reals then
+        // floors, where `active_window` truncates then clamps. For non-negative values the two must
+        // agree, so a divergence is a real off-by-one rather than a shared mistake.
+        let (fleft, fright) = elution_half_widths(io.elution.sigma_frames, g.n_sigma, &io.elution.shape);
         let fs = (io.apex_frame - fleft).max(0.0).floor() as u32;
         let fe = (io.apex_frame + fright).min(last_frame).floor() as u32;
         let ss = (io.scan_center - shalf).max(0.0).floor() as u32;
         let se = (io.scan_center + shalf).min(last_scan).floor() as u32;
 
         for frame in fs..=fe {
-            let ew = elution_frac(frame as f64 - 0.5, frame as f64 + 0.5, io.apex_frame, g.sigma_frames, &g.shape);
+            let ew = io.elution.frac(frame as f64 - 0.5, frame as f64 + 0.5, io.apex_frame);
             if ew <= 0.0 {
                 continue;
             }
@@ -997,7 +1050,7 @@ pub fn frame_chunks(n_frames: u32, k: usize) -> Vec<(u32, u32)> {
 pub fn bucket_ions(ions: &[Ion], g: &Geometry, chunks: &[(u32, u32)]) -> Vec<Vec<usize>> {
     let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); chunks.len()];
     for (i, io) in ions.iter().enumerate() {
-        let (ws, we) = active_window(io.apex_frame, g);
+        let (ws, we) = active_window(io, g);
         for (c, &(lo, hi)) in chunks.iter().enumerate() {
             if ws < hi && we >= lo {
                 buckets[c].push(i);
@@ -1049,14 +1102,14 @@ mod tests {
     fn fixture() -> Vec<Ion> {
         vec![
             // long-lived, mid grid, two isotope peaks
-            Ion { apex_frame: 20.0, scan_center: 15.0, abundance: 100.0, peaks: vec![(500, 1.0), (504, 0.4)] },
+            Ion { apex_frame: 20.0, scan_center: 15.0, abundance: 100.0, peaks: vec![(500, 1.0), (504, 0.4)], elution: Elution::global(2.5, PeakShape::Gaussian) },
             // co-elutes with the next one at the SAME locus + SAME tof -> bins must add
-            Ion { apex_frame: 20.3, scan_center: 15.0, abundance: 50.0, peaks: vec![(500, 1.0)] },
-            Ion { apex_frame: 20.1, scan_center: 15.0, abundance: 30.0, peaks: vec![(500, 1.0)] },
+            Ion { apex_frame: 20.3, scan_center: 15.0, abundance: 50.0, peaks: vec![(500, 1.0)], elution: Elution::global(2.5, PeakShape::Gaussian) },
+            Ion { apex_frame: 20.1, scan_center: 15.0, abundance: 30.0, peaks: vec![(500, 1.0)], elution: Elution::global(2.5, PeakShape::Gaussian) },
             // scan-0 boundary (half the mobility peak is clamped away)
-            Ion { apex_frame: 8.0, scan_center: 0.4, abundance: 70.0, peaks: vec![(300, 1.0)] },
+            Ion { apex_frame: 8.0, scan_center: 0.4, abundance: 70.0, peaks: vec![(300, 1.0)], elution: Elution::global(2.5, PeakShape::Gaussian) },
             // last-frame boundary
-            Ion { apex_frame: 39.2, scan_center: 22.0, abundance: 40.0, peaks: vec![(900, 1.0), (905, 0.2)] },
+            Ion { apex_frame: 39.2, scan_center: 22.0, abundance: 40.0, peaks: vec![(900, 1.0), (905, 0.2)], elution: Elution::global(2.5, PeakShape::Gaussian) },
         ]
     }
 
@@ -1148,7 +1201,7 @@ mod tests {
     #[test]
     fn lone_interior_ion_conserves_analytic_mass() {
         let g = geom();
-        let ion = Ion { apex_frame: 20.0, scan_center: 15.0, abundance: 100.0, peaks: vec![(500, 1.0), (504, 0.4)] };
+        let ion = Ion { apex_frame: 20.0, scan_center: 15.0, abundance: 100.0, peaks: vec![(500, 1.0), (504, 0.4)], elution: Elution::global(2.5, PeakShape::Gaussian) };
         let cube = sweep_render(std::slice::from_ref(&ion), &g);
         let emitted: f64 = cube.values().sum();
 

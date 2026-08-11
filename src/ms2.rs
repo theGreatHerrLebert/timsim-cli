@@ -40,13 +40,17 @@ pub struct DiaIon {
     /// through the same quad diagonal — modelling residual precursor bleed-through. `0.0` (default) is
     /// full fragmentation. Mirrors v1's `precursor_survival`.
     pub survival: f64,
+    /// THIS ion's chromatographic peak — see [`crate::render::Ion::elution`].
+    pub elution: crate::render::Elution,
 }
 
 /// Elution frame window `[start, end]` (1-based, to match the DIA schedule / `Frames.Id`). Public so the
 /// chunked streaming render can decide which ions are active in a given frame range without duplicating
 /// the window maths.
-pub fn active_frames(apex: f64, g: &Geometry) -> (u32, u32) {
-    let (left, right) = crate::render::elution_half_widths(g.sigma_frames, g.n_sigma, &g.shape);
+pub fn active_frames(apex: f64, e: &crate::render::Elution, g: &Geometry) -> (u32, u32) {
+    // Takes the Elution rather than an ion so DiaIon and the DIA staging struct can share it — and
+    // so the window is always THIS peptide's, never the run's.
+    let (left, right) = e.half_widths(g.n_sigma);
     let start = (apex - left).max(1.0) as u32;
     let end = ((apex + right) as u32).min(g.n_frames);
     (start, end)
@@ -68,11 +72,11 @@ pub fn ms2_render(ions: &[DiaIon], sched: &DiaSchedule, g: &Geometry) -> BTreeMa
         }
         let f = frame as f64;
         for ion in ions {
-            let (fs, fe) = active_frames(ion.apex_frame, g);
+            let (fs, fe) = active_frames(ion.apex_frame, &ion.elution, g);
             if frame < fs || frame > fe {
                 continue;
             }
-            let ew = elution_frac(f - 0.5, f + 0.5, ion.apex_frame, g.sigma_frames, &g.shape);
+            let ew = ion.elution.frac(f - 0.5, f + 0.5, ion.apex_frame);
             if ew <= 0.0 {
                 continue;
             }
@@ -132,13 +136,13 @@ pub fn ms2_reference(ions: &[DiaIon], sched: &DiaSchedule, g: &Geometry) -> BTre
     let wmap = independent_window_map(sched);
     let mut out: BTreeMap<(u32, u32, u32), f64> = BTreeMap::new();
     for ion in ions {
-        let (fs, fe) = active_frames(ion.apex_frame, g);
+        let (fs, fe) = active_frames(ion.apex_frame, &ion.elution, g);
         for frame in fs..=fe {
             let Some(group) = sched.pattern[((frame - 1) % sched.cycle_len) as usize] else {
                 continue; // MS1 frame — no fragments
             };
             let f = frame as f64;
-            let ew = elution_frac(f - 0.5, f + 0.5, ion.apex_frame, g.sigma_frames, &g.shape);
+            let ew = ion.elution.frac(f - 0.5, f + 0.5, ion.apex_frame);
             if ew <= 0.0 {
                 continue;
             }
@@ -210,7 +214,7 @@ pub fn dia_render_range<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
     mut emit: F,
 ) {
     let n = ions.len();
-    let windows: Vec<(u32, u32)> = ions.iter().map(|io| active_frames(io.apex_frame, g)).collect();
+    let windows: Vec<(u32, u32)> = ions.iter().map(|io| active_frames(io.apex_frame, &io.elution, g)).collect();
     // Enter in frame_start order; sort indices, not the ions (peaks stay put).
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_unstable_by_key(|&i| windows[i].0);
@@ -246,7 +250,7 @@ pub fn dia_render_range<F: FnMut(u32, u8, &[(u32, u32, f64)])>(
         buf.clear();
         for &idx in &active {
             let ion = &ions[idx];
-            let ew = elution_frac(f - 0.5, f + 0.5, ion.apex_frame, g.sigma_frames, &g.shape);
+            let ew = ion.elution.frac(f - 0.5, f + 0.5, ion.apex_frame);
             if ew <= 0.0 {
                 continue;
             }
@@ -343,6 +347,7 @@ mod tests {
             ms1_peaks: vec![],
             ms2_peaks: vec![(300, 1.0), (450, 0.4)],
             survival: 0.0,
+            elution: crate::render::Elution::global(2.5, crate::render::PeakShape::Gaussian),
         }
     }
 
