@@ -751,7 +751,7 @@ fn main() -> Result<()> {
     // window: it is a property of the acquisition being replayed, not of this simulator.
     if a.min_peak_intensity == 0 {
         a.min_peak_intensity = match a.reference_d.as_ref().and_then(|r| {
-            reference_intensity_floor(r.to_str().unwrap_or(""), p.n_scans, 24)
+            reference_intensity_floor(r.to_str().unwrap_or(""), 24)
         }) {
             Some(f) => {
                 eprintln!("  min_peak_intensity = {f} (inherited from the reference .d's own floor)");
@@ -1338,7 +1338,7 @@ fn a2_state(f: u32, s: usize, seed: u64) -> u64 {
 ///
 /// Samples a bounded number of frames rather than the whole run: the floor is the minimum of a very
 /// large sample either way, and reading a full `.d` to learn one integer is not a good trade.
-fn reference_intensity_floor(ref_d: &str, n_scans: u32, sample_frames: usize) -> Option<u32> {
+fn reference_intensity_floor(ref_d: &str, sample_frames: usize) -> Option<u32> {
     use ms_io::data::dataset::TimsDataset;
     let ds = TimsDataset::new("", ref_d, false, false);
     let meta = ms_io::data::meta::read_meta_data_sql(ref_d).ok()?;
@@ -1348,8 +1348,21 @@ fn reference_intensity_floor(ref_d: &str, n_scans: u32, sample_frames: usize) ->
     let step = (meta.len() / sample_frames.max(1)).max(1);
     let mut floor = u32::MAX;
     for m in meta.iter().step_by(step).take(sample_frames) {
+        // Deliberately UNBOUNDED in m/z, scan and mobility. Any bound can only bias the floor
+        // UPWARD, by hiding the peak that actually sets it, and bounding scan by our own output
+        // grid would make a property of the reference depend on the geometry we happen to be
+        // rendering. Only the intensity bound of 1.0 is a real filter, excluding empty bins.
         let fr = ds.get_frame(m.id as u32).filter_ranged(
-            0.0, 2000.0, 0, n_scans as i32, 0.0, 5.0, 1.0, f64::MAX, 0, i32::MAX,
+            0.0,
+            f64::MAX,
+            0,
+            i32::MAX,
+            0.0,
+            f64::MAX,
+            1.0,
+            f64::MAX,
+            0,
+            i32::MAX,
         );
         for &it in fr.ims_frame.intensity.iter() {
             if it >= 1.0 && (it as u32) < floor {
