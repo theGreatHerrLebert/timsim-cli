@@ -211,6 +211,30 @@ real data's per-peak shape while destroying the recall-vs-abundance harness this
 A provisional knob belongs on **spreading** — intensity-conserving, on the observation model — never
 on the truth axis.
 
+### Identification effect, measured (DIA-NN 2.5.0, q<0.01, 490k peptides, `hela5k.speclib`)
+
+Two variables were separated: the floor, and whether background is *modelled* (`--noise-real-data`)
+or *literally superimposed* (`--spike-into` the blank).
+
+| render | floor | background | IDs | FDP | recall (detectable) | decile curve |
+|---|---|---|---|---|---|---|
+| ramp `L050_R2` | 1 | modelled | 66,561 | 0.33% | — | — |
+| A2 arm | 10 (inherited) | modelled | 39,537 | 0.34% | 17.9% | 1% → 77% |
+| spike arm | 10 (inherited) | **real blank** | 39,388 | **0.26%** | 17.9% | 1% → 77% |
+
+**Superimposing real background costs 0.5% of identifications.** The whole 41% drop is the floor —
+i.e. the old default of 1 was inflating identifications by ~27,000 precursors resting on 1–2 count
+peaks the instrument would never have recorded. That is a correction, not a regression.
+
+Two consequences for how the benchmark is used:
+
+- **Spike-into-real is safe.** FDR control is unaffected (FDP 0.26% against a 1% nominal, marginally
+  *better* than the modelled background), and the recall-vs-abundance curve is unchanged. So real
+  background can be used to get real chemical noise and real interferences without paying for it in
+  search quality — the noise-only control already exists to subtract background IDs from FDP.
+- **Any recall figure predating 2026-08-13 is inflated** by the floor-of-1 artefact and is not
+  comparable to figures measured after it. The ramp-004 arms are affected.
+
 **Secondary — emergent-shape diagnostics (regression checks, NOT primary objectives):**
 - After the full observation model, the pooled per-peak median / density / dynamic range land within
   tolerance of real, **stratified by frame type and gradient region**, with **analyte and background
