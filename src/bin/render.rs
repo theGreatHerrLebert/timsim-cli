@@ -165,7 +165,11 @@ struct Args {
     /// cutoff: without it, the 2-D Gaussian spread emits a haze of intensity-1 bins that dominate the
     /// peak count and drown the chromatographic shape in quantisation noise. `1` keeps every non-zero
     /// bin (legacy behaviour).
-    #[arg(long, default_value_t = 1)]
+    /// `0` (the DEFAULT) inherits the REFERENCE acquisition's own reporting floor — the smallest
+    /// non-zero intensity it ever recorded. Measured across nine real `.d` files that is 10 on some
+    /// batches and 21 on others, stable within a batch, so no constant is correct; see
+    /// `reference_intensity_floor`. Without a reference it falls back to 1 (keep every non-zero bin).
+    #[arg(long, default_value_t = 0)]
     min_peak_intensity: u32,
     /// Incomplete fragmentation (DIA only): the fraction of each precursor that survives the quad
     /// INTACT and bleeds into the MS2 windows, drawn per-ion (identity-keyed on precursor id) in
@@ -743,6 +747,22 @@ fn main() -> Result<()> {
             a.run_intensity_cv * 100.0, a.sample.as_deref().unwrap_or("")
         );
     }
+    // Inherit the instrument's reporting floor, for the same reason as the clock and the mobility
+    // window: it is a property of the acquisition being replayed, not of this simulator.
+    if a.min_peak_intensity == 0 {
+        a.min_peak_intensity = match a.reference_d.as_ref().and_then(|r| {
+            reference_intensity_floor(r.to_str().unwrap_or(""), p.n_scans, 24)
+        }) {
+            Some(f) => {
+                eprintln!("  min_peak_intensity = {f} (inherited from the reference .d's own floor)");
+                f
+            }
+            None => {
+                eprintln!("  min_peak_intensity = 1 (no reference floor available; keeps every non-zero bin)");
+                1
+            }
+        };
+    }
     let mob = MobilityWidth {
         // 0 means "no per-ion widths": `mobility_sigma_scans` rejects a non-positive target, so every
         // ion falls through to the flat fallback without a second code path to keep in step.
@@ -1295,6 +1315,51 @@ fn a2_state(f: u32, s: usize, seed: u64) -> u64 {
 /// and cached. Frames are classified via the schedule (NOT a 1:1 output↔reference assumption); pools come
 /// from the reference metadata.
 #[allow(clippy::too_many_arguments)]
+/// The smallest non-zero intensity the REFERENCE acquisition ever recorded.
+///
+/// This is the instrument's own reporting floor, and it is NOT a universal constant: measured across
+/// nine real timsTOF `.d` files it is **10** on some batches and **21** on others (K240723 = 21,
+/// G211202 / F164xx / G241217 = 10), stable within a batch and differing between them. It is the
+/// smallest recordable value in whatever intensity units that method produces — accumulation and
+/// summation settings move it — so hardcoding any number is wrong, and so is any fixed fraction of
+/// the median (floor/median runs 0.40 / 0.17 / 0.11 across those same files).
+///
+/// Since the render already replays a reference acquisition, the floor is inherited from it, exactly
+/// as the frame clock, the DIA window table, the mobility calibration and the mobility window are.
+/// Every previous instance where this render hardcoded a value instead of inheriting one turned out
+/// to be a defect: `--cycle-seconds 0.1` compressed the time axis 5.2%, and the clamped mobility
+/// window rendered phantom ions.
+///
+/// Why it matters is narrower than it looks. The floor barely changes identification on its own —
+/// what it does is make the COUNTING-NOISE model well posed. With a floor of 1, Poisson turns bins
+/// expecting 0.4 counts into recorded peaks and MS2 density went 2.42 -> 13.3 peaks/scan; at the
+/// reference's own floor the same noise moves it 2.42 -> 2.43. Without this, `--ion-count-noise` is
+/// unconstrained and manufactures signal.
+///
+/// Samples a bounded number of frames rather than the whole run: the floor is the minimum of a very
+/// large sample either way, and reading a full `.d` to learn one integer is not a good trade.
+fn reference_intensity_floor(ref_d: &str, n_scans: u32, sample_frames: usize) -> Option<u32> {
+    use ms_io::data::dataset::TimsDataset;
+    let ds = TimsDataset::new("", ref_d, false, false);
+    let meta = ms_io::data::meta::read_meta_data_sql(ref_d).ok()?;
+    if meta.is_empty() {
+        return None;
+    }
+    let step = (meta.len() / sample_frames.max(1)).max(1);
+    let mut floor = u32::MAX;
+    for m in meta.iter().step_by(step).take(sample_frames) {
+        let fr = ds.get_frame(m.id as u32).filter_ranged(
+            0.0, 2000.0, 0, n_scans as i32, 0.0, 5.0, 1.0, f64::MAX, 0, i32::MAX,
+        );
+        for &it in fr.ims_frame.intensity.iter() {
+            if it >= 1.0 && (it as u32) < floor {
+                floor = it as u32;
+            }
+        }
+    }
+    (floor != u32::MAX).then_some(floor)
+}
+
 fn build_frame_noise(
     ref_d: &str,
     sched: &timsim_cli::dia::DiaSchedule,
