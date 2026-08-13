@@ -141,8 +141,9 @@ Applied *after* ion generation, per frame type, ideally conditioned on m/z / mob
 1. **Signal spreading** — an ion's current over RT (frames) and mobility (scans) Gaussians, and its
    isotope/fragment structure. Partly present already; it is a large part of why per-peak intensity is
    far below total ion abundance.
-2. **Count floor / censoring** at the detector threshold (~21). Implement as a *real* floor/censor, not
-   only the current post-quantisation drop cutoff (`--min-peak-intensity`).
+2. **Count floor / censoring** at the detector threshold. **DONE (2026-08-13), by inheritance rather
+   than by constant** — see "The floor is not a constant" below. `--min-peak-intensity 0` measures the
+   floor from the reference `.d`'s own recorded minimum.
 3. **Ion-count noise** — shot/counting statistics on the (small) per-bin counts.
 4. **Background process** — the dense low-level population that fills the ~30× density gap, conditioned
    on frame type / m/z / mobility / gradient region. **This needs a method-matched blank to measure**
@@ -160,7 +161,42 @@ Applied *after* ion generation, per frame type, ideally conditioned on m/z / mob
 - Feature-level isotope/envelope intensities keep their true ratios.
 
 **Hard compatibility check:**
-- Per-peak floor is exactly **21** on MS1 and MS2 (an instrument/method threshold, verified in blanks).
+- Per-peak floor equals **the reference `.d`'s own floor** on MS1 and MS2. NOT a constant — see below.
+
+## The floor is not a constant (2026-08-13)
+
+An earlier version of this document asserted the floor "is exactly 21". A survey of nine real `.d`
+files says otherwise: it is **10** (`G211202` ×2, `F164xx` ×3, `G241217` blank) or **21** (`K240723`
+×3) — stable within an acquisition batch, different between batches. Hardcoding 21 would have been
+the fourth instance of the same mistake this render has already made three times (clock, mobility
+window, intensity floor), so the floor is now **inherited from the reference `.d`**.
+
+Measured effect at realistic complexity (490k peptides, L050, `--noise-real-data`), against real
+`K240723`:
+
+| | peaks/scan | floor | p50 | p99 | p99.9 | max | dyn |
+|---|---|---|---|---|---|---|---|
+| sim, floor = 1 (old default) | 121.9 | 1 | 23 | 3,874 | 37,794 | 648,327 | 37,794× |
+| sim, floor inherited | 76.4 | 10 | **55** | 6,735 | 54,801 | 603,201 | 5,480× |
+| **real K240723** | 333.6 | 21 | **53** | 245 | 1,366 | 63,965 | 55× |
+| real blank `G241217` | 39.5 | 10 | 57 | 137 | 370 | 3,099 | 37× |
+
+Two things follow, and the second corrects a framing error made earlier in this document's history.
+
+**The median is now right** (55 vs 53). The old default of 1 let counting noise manufacture 1–2 count
+peaks no instrument would have recorded, which inflated density and dragged the median to 23.
+
+**The dynamic-range gap is an upper-tail problem, not a whole-distribution problem.** The blank's own
+`p50` is 57 against the loaded run's 53 — i.e. *the median peak in real data is a background peak*,
+and 200 ng of HeLa on column adds ~295 peaks/scan and a bright tail while barely moving the median.
+So the residual error is concentrated in `p99`/`p99.9` (27–40× high) and peak density (**4.4× short**),
+both symptoms of the same defect: one peptide's signal occupies too few bins, each too bright. Item 1
+(signal spreading) remains the blocker, and it still needs the measurement.
+
+Do **not** close the gap by narrowing abundance or lowering `--intensity-scale`. Both would reproduce
+real data's per-peak shape while destroying the recall-vs-abundance harness this benchmark rests on.
+A provisional knob belongs on **spreading** — intensity-conserving, on the observation model — never
+on the truth axis.
 
 **Secondary — emergent-shape diagnostics (regression checks, NOT primary objectives):**
 - After the full observation model, the pooled per-peak median / density / dynamic range land within
