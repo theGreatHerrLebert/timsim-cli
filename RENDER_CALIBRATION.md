@@ -171,15 +171,28 @@ files says otherwise: it is **10** (`G211202` ×2, `F164xx` ×3, `G241217` blank
 the fourth instance of the same mistake this render has already made three times (clock, mobility
 window, intensity floor), so the floor is now **inherited from the reference `.d`**.
 
-Measured effect at realistic complexity (490k peptides, L050, `--noise-real-data`), against real
-`K240723`:
+Measured effect at realistic complexity (490k peptides, L050). **Comparator matters and has been got
+wrong repeatedly**: the sim is rendered against blank `G241217_011`, whose method-matched loaded run
+is `O240206_015` (both 36w / 300–1165 / 1/K0 0.6–1.6). `K240723` is a *different method* and is
+denser with a tighter distribution, so quoting the gap against it overstates it by roughly 2×.
 
 | | peaks/scan | floor | p50 | p99 | p99.9 | max | dyn |
 |---|---|---|---|---|---|---|---|
 | sim, floor = 1 (old default) | 121.9 | 1 | 23 | 3,874 | 37,794 | 648,327 | 37,794× |
 | sim, floor inherited | 76.4 | 10 | **55** | 6,735 | 54,801 | 603,201 | 5,480× |
-| **real K240723** | 333.6 | 21 | **53** | 245 | 1,366 | 63,965 | 55× |
-| real blank `G241217` | 39.5 | 10 | 57 | 137 | 370 | 3,099 | 37× |
+| sim, spiked into the blank | 76.3 | 10 | **55** | 6,737 | 54,809 | 603,201 | 5,481× |
+| **real `O240206_015` (method-matched)** | 240.9 | 21 | **56** | 605 | 3,283 | 26,943 | 131× |
+| real blank `G241217_011` | 39.5 | 10 | 57 | 137 | 370 | 3,099 | 37× |
+| real `K240723` (different method) | 333.6 | 21 | 53 | 245 | 1,366 | 63,965 | 55× |
+
+Against the correct comparator the residual is **3.2× on peak density** and **11× on `p99`**, not the
+4.4× / 27× that the mismatched comparison gave. Netting out background (39.5 peaks/scan, present in
+both), the **analyte** deficit is 201 vs 36.8 peaks/scan ≈ **5.5×**.
+
+Note the floors differ *within* the matched pair — blank 10, loaded 21. Method matching fixes peak
+density and m/z range; it does **not** fix the floor, which tracks acquisition batch. So "inherit the
+floor from the reference" reproduces the reference's censoring, which is the right guarantee, but it
+does not automatically equal the floor of whichever loaded run is being imitated.
 
 Two things follow, and the second corrects a framing error made earlier in this document's history.
 
@@ -187,11 +200,11 @@ Two things follow, and the second corrects a framing error made earlier in this 
 peaks no instrument would have recorded, which inflated density and dragged the median to 23.
 
 **The dynamic-range gap is an upper-tail problem, not a whole-distribution problem.** The blank's own
-`p50` is 57 against the loaded run's 53 — i.e. *the median peak in real data is a background peak*,
-and 200 ng of HeLa on column adds ~295 peaks/scan and a bright tail while barely moving the median.
-So the residual error is concentrated in `p99`/`p99.9` (27–40× high) and peak density (**4.4× short**),
-both symptoms of the same defect: one peptide's signal occupies too few bins, each too bright. Item 1
-(signal spreading) remains the blocker, and it still needs the measurement.
+`p50` is 57 against the matched loaded run's 56 — i.e. *the median peak in real data is a background
+peak*, and the analyte load adds ~200 peaks/scan and a bright tail while barely moving the median.
+So the residual error is concentrated in `p99`/`p99.9` and in peak density, both symptoms of the same
+defect: one peptide's signal occupies too few bins, each too bright. Item 1 (signal spreading) remains
+the blocker, and it still needs the measurement.
 
 Do **not** close the gap by narrowing abundance or lowering `--intensity-scale`. Both would reproduce
 real data's per-peak shape while destroying the recall-vs-abundance harness this benchmark rests on.
