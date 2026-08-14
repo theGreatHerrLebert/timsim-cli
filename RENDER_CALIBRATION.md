@@ -216,15 +216,72 @@ on the truth axis.
 Two variables were separated: the floor, and whether background is *modelled* (`--noise-real-data`)
 or *literally superimposed* (`--spike-into` the blank).
 
-| render | floor | background | IDs | FDP | recall (detectable) | decile curve |
-|---|---|---|---|---|---|---|
-| ramp `L050_R2` | 1 | modelled | 66,561 | 0.33% | — | — |
-| A2 arm | 10 (inherited) | modelled | 39,537 | 0.34% | 17.9% | 1% → 77% |
-| spike arm | 10 (inherited) | **real blank** | 39,388 | **0.26%** | 17.9% | 1% → 77% |
+**Match the realism level before comparing rows.** An earlier version of this table did not, and drew
+a wrong conclusion. The hand-run arms passed `--ion-count-noise true --instrument-cv 0.15`, which is
+**R3**, not R2. All rows are L050.
 
-**Superimposing real background costs 0.5% of identifications.** The whole 41% drop is the floor —
-i.e. the old default of 1 was inflating identifications by ~27,000 precursors resting on 1–2 count
-peaks the instrument would never have recorded. That is a correction, not a regression.
+| render | realism | floor | background | IDs | FDP | recall (detectable) |
+|---|---|---|---|---|---|---|
+| ramp-004 `L050_R2` | R2 | 1 | modelled | 66,561 | 0.33% | — |
+| **ramp-005 `L050_R2`** | R2 | 10 (inherited) | modelled | **32,410** | 0.27% | **14.7%** |
+| ramp-004 `L050_R3` | R3 | 1 | modelled | 140,230 | 0.30% | — |
+| hand-run A2 arm | R3 | 10 (inherited) | modelled | 39,537 | 0.34% | 17.9% |
+| hand-run spike arm | R3 | 10 (inherited) | **real blank** | 39,388 | **0.26%** | 17.9% |
+
+**The floor costs 51% of identifications at R2** (66,561 → 32,410) and **72% at R3** (140,230 →
+39,537). It bites harder the more counting noise is on, which is the point: without a floor,
+`--ion-count-noise` is unconstrained and manufactures recordable peaks from bins expecting a
+fraction of a count. Both are corrections, not regressions.
+
+### A2 matches the histogram, NOT the searchable content (2026-08-13)
+
+The agreement below (0.4% on peak counts, distributions equal to 3 s.f.) was initially read as
+validating the A2 background model. **That reading is wrong, and the error is instructive.**
+
+Searched with the SAME library (`hela5k.speclib`, 4,995 proteins), same DiaNN settings:
+
+| | precursors @1% FDR | proteins |
+|---|---|---|
+| real blank `G241217_011` | **1,389** | **341** |
+| A2 modelled background (noise-only control) | 201 | **0** |
+
+A real blank yields 341 proteins of ordinary human carryover — no contaminant panel required. The
+modelled background yields none. A2 reproduces *where peaks are and how bright they are*; it does not
+reproduce the coherent peptide-like structure across RT × mobility × isotope that a search engine
+assembles into an identification.
+
+**Matching the marginal peak distribution is not matching the data.** Any future background model
+must be validated by SEARCHING it, not only by comparing histograms — the two diagnostics disagree
+here by a factor of ∞ on proteins while agreeing to 0.4% on peak count.
+
+Consequences: (1) the FDP background control is effectively inert for A2 runs — it subtracts 2–3 IDs
+where real background offers ~1,389 identifiable precursors; it works as designed only for
+`--spike-into`, where the control IS the real blank. (2) Every A2 arm is an easier search than
+reality.
+
+**CLOSED — the answer key is not inflated by blank-derived IDs.** Intersecting the three searches:
+
+| | |
+|---|---|
+| real blank IDs | 1,353 |
+| blank ∩ spike-arm | 183 |
+| blank ∩ A2-arm | **215** |
+| (blank ∩ spike) \ A2 — blank-driven candidates | 4 |
+| genuinely blank-only, credited as recall | **1** of 39,388 |
+
+The decisive check is that **`blank ∩ A2` (215) EXCEEDS `blank ∩ spike` (183)**. The A2 arm contains
+no real-blank signal, so those 215 can only be simulated peptides the blank happens to share (both
+are HeLa off the same 5k proteome). Contamination would make spike overlap MORE than A2; it overlaps
+less. The blank's identifications are simply outcompeted: simulated signal is orders of magnitude
+brighter, and with ~39k strong IDs setting the FDR threshold the weak blank peptides fall below it —
+which also explains why spike mode gains no recall over A2.
+
+**Spike-mode recall is safe to quote.** The A2 background being too clean (above) is still real, and
+still makes every A2 arm an easier search than reality.
+
+**Superimposing real background costs 0.5% of identifications** (39,388 vs 39,537). That comparison
+is sound where the floor one was not: both hand-run arms carried identical flags and differ only in
+background source.
 
 Two consequences for how the benchmark is used:
 
@@ -234,6 +291,8 @@ Two consequences for how the benchmark is used:
   search quality — the noise-only control already exists to subtract background IDs from FDP.
 - **Any recall figure predating 2026-08-13 is inflated** by the floor-of-1 artefact and is not
   comparable to figures measured after it. The ramp-004 arms are affected.
+- **The R2 baseline is 14.7% (ramp-005 L050), not the 17.9% quoted earlier**, which came from an
+  R3-configured hand-run. Realism level is part of the comparison, not a detail.
 
 **Secondary — emergent-shape diagnostics (regression checks, NOT primary objectives):**
 - After the full observation model, the pooled per-peak median / density / dynamic range land within
