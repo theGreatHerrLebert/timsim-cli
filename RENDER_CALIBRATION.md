@@ -233,6 +233,41 @@ a wrong conclusion. The hand-run arms passed `--ion-count-noise true --instrumen
 `--ion-count-noise` is unconstrained and manufactures recordable peaks from bins expecting a
 fraction of a count. Both are corrections, not regressions.
 
+### Library ratio: costs FDP, not recall (2026-08-14)
+
+Same ramp-005 `L050` render, searched twice. This brackets the benchmark's most-questioned shortcut —
+that its library (4,995 proteins) matches the simulated proteome ~1:1, where a real HeLa search uses
+the full human proteome.
+
+| | 5k library (as the ramp ran) | full 20,535 library |
+|---|---|---|
+| library | 4,995 proteins / ~1.14M target precursors | 20,512 / ~4.53M |
+| **library ratio** vs 1,160,215 answer-key precursors | **0.99 : 1** | **3.9 : 1** |
+| IDs | 32,410 | 31,351 |
+| **recall (detectable)** | 14.7% | **14.1%** |
+| D10 | 73% | 73% |
+| FDP, raw | 0.27% | **0.97%** |
+| background IDs subtracted | 1–3 (no-op) | **103** |
+| **FDP, background-corrected** | 0.27% | **0.64%** |
+
+**Recall is nearly insensitive to library ratio** (4% relative, decile structure unchanged, D10
+identical). An earlier version of this document asserted the ~1:1 library inflates recall. **It does
+not.** What it inflates is FDP quality: the search space was too small to offer wrong answers.
+
+**The FDP background control is a no-op under a small library and a real safeguard under a large
+one.** With the 5k library it subtracts 1–3 IDs *regardless of background source* — including when
+fed a REAL blank carrying 1,389 identifiable precursors. The reason is structural: the scorer computes
+`bg_only = background_IDs − all_keys` (`v2_thermo_eval.py:56`), and blank contamination is HeLa
+carryover, i.e. the same proteome being simulated, so its peptides are legitimate answer-key entries
+and are correctly excluded. Only background identifiable *outside* the answer key can count. The full
+library makes exactly that available — the blank yields 1,491 proteins against it vs 341 against the
+5k — and the control then removes 103 IDs, **a third of all apparent false positives**.
+
+Consequences for reading ramp-004 / ramp-005: **their recall curves stand**; **their FDP figures are
+optimistic by roughly 3.6×** and their background controls were inert. The realistic
+background-corrected FDP at L050 is **0.64%**, still inside the 1% nominal — so the simulator's false
+discovery behaviour survives a realistic search, which the 0.27% never actually demonstrated.
+
 ### A2 matches the histogram, NOT the searchable content (2026-08-13)
 
 The agreement below (0.4% on peak counts, distributions equal to 3 s.f.) was initially read as
