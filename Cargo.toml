@@ -66,6 +66,10 @@ mscore = { version = "0.5.0", optional = true }
 # mobility-derived collision energies are the policy's own numbers, not a second copy of
 # `ce_bias + ce_slope*scan`. Optional, alongside the rest of the tdf machinery.
 timsim-types = { version = "0.1.0", optional = true }
+# Reading the TEMPLATE `.raw` back, to inherit its reporting floor and intensity regime the same way
+# `timsim-render` inherits the reference `.d`'s (see `template_ms1_stats`). `timsim-core/thermo`
+# already links this crate; pinning the SAME version and source makes cargo unify the two.
+thermorawfile = { version = "0.1.0", optional = true }
 
 [features]
 # Enables everything that touches the real TDF format + spectrum generation — the encode path in the
@@ -75,7 +79,7 @@ tdf = ["dep:ms-io", "dep:mscore", "dep:timsim-types", "dep:rusqlite"]
 # The Thermo Astral `.raw` render driver (timsim-render-thermo): pulls timsim-core's thermo feature (the
 # thermorawfile-backed writer seam). Off by default so default builds don't pull the thermo dep.
 #   cargo build --release -p timsim-cli --features thermo
-thermo = ["dep:ms-io", "dep:timsim-core", "timsim-core/thermo", "dep:mscore", "dep:rusqlite"]
+thermo = ["dep:ms-io", "dep:timsim-core", "timsim-core/thermo", "dep:mscore", "dep:rusqlite", "dep:thermorawfile"]
 # The SCIEX ZenoTOF SWATH -> open mzML render driver (timsim-render-sciex): pulls timsim-core's mzml
 # feature (mzdata-backed writer) + mscore (quadrupole transmission). NO ms-io, NO thermorawfile, NO
 # sciexwiff/sciex-io — the lean mzML path is legally clean (native .wiff is a rustims-local satellite).
