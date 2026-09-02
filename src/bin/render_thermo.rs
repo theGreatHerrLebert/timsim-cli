@@ -58,8 +58,42 @@ struct Args {
     #[arg(long, default_value_t = 15.0)] transmission_k: f64,
     /// Fraction of the template RT span trimmed at each end (avoid loading/wash regions).
     #[arg(long, default_value_t = 0.05)] gradient_trim: f64,
-    #[arg(long, default_value_t = 1.0e5)] intensity_scale: f64,
-    #[arg(long, default_value_t = 1.0)] min_peak_intensity: f64,
+    /// Multiplies every authored peak. `0` (the DEFAULT) CALIBRATES against the template: the
+    /// renderer measures the template's own MS1 intensity median, then solves for the scale at which
+    /// the median of its OWN authored peaks — counting only those that clear the inherited floor,
+    /// which is the same population the template's median is taken over — matches it. Comparing
+    /// against every authored peak instead, including the dim ones the floor deletes, biases the
+    /// scale up. Orbitrap intensity is an arbitrary
+    /// detector unit, not the timsTOF's ion count, so the Bruker path's constant is meaningless
+    /// here — carrying `5e5` over from `timsim-render` put the rendered MS1 median four orders of
+    /// magnitude BELOW the template's own reporting floor. This is a unit conversion, not a tuning
+    /// knob: it sets the axis the floor is then applied on. Pass a positive value to override.
+    #[arg(long, default_value_t = 0.0)] intensity_scale: f64,
+    /// Drop authored peaks below this floor. `0` (the DEFAULT) inherits the TEMPLATE acquisition's
+    /// own reporting floor — the smallest non-zero intensity it ever recorded — for the same reason
+    /// `timsim-render` inherits the reference `.d`'s: it is a property of the acquisition being
+    /// replayed, not of this simulator. Without a readable template it falls back to 1.
+    #[arg(long, default_value_t = 0.0)] min_peak_intensity: f64,
+    /// The template's own MS1 intensity MEDIAN, i.e. the target `--intensity-scale 0` calibrates
+    /// onto. `0` (the DEFAULT) measures it off the template. Supply it — together with an explicit
+    /// `--min-peak-intensity` — when the template is PURE PROFILE: the two numbers must come from
+    /// the SAME domain, and a profile template exposes no stored centroids, so the renderer can only
+    /// read the baseline. Mixing a centroid-domain floor with a profile-domain median silently
+    /// calibrates onto the wrong axis.
+    #[arg(long, default_value_t = 0.0)] template_ms1_median: f64,
+    /// Resolve the floor + scale, print the calibration record as JSON, and EXIT before authoring.
+    ///
+    /// This is how a cohort gets ONE calibration constant instead of N. Re-estimating the scale per
+    /// render lets a difference in sample composition be absorbed into a compensating rescale —
+    /// which, in a cohort whose whole point is a planted per-protein differential, partially cancels
+    /// the signal being measured. Calibrate once against the template, freeze the number into the
+    /// job config, and every arm renders on the same axis.
+    #[arg(long)] calibrate_only: bool,
+    /// The MS2 reporting floor. `0` (the DEFAULT) inherits the template's own MS2 floor, which is a
+    /// DIFFERENT number from the MS1 one — measured on a stock Exploris DIA run, MS1 censors at
+    /// 25,760 and MS2 at 575.5. Reusing the MS1 floor for MS2 censors fragments ~45x too hard, and a
+    /// DIA search scores on fragments.
+    #[arg(long, default_value_t = 0.0)] min_peak_intensity_ms2: f64,
     /// Sidecar answer key (per-precursor DIA truth).
     #[arg(long)] thermo_truth: Option<PathBuf>,
     /// Durable run manifest (JSON): renderer identity, template digest, method, counts, truth schema.
@@ -71,6 +105,93 @@ struct Args {
     /// The collision energy (NCE) the fragments were predicted at — validated against the template's
     /// actual NCE (a mismatch means the library was built for a different CE than the template was run at).
     #[arg(long)] expected_ce: Option<f64>,
+}
+
+/// `p10/p50/p90/p99` of a SORTED slice — the acceptance-test summary. The median alone is a
+/// location anchor and is insensitive to exactly the defect that matters here: a large excess at the
+/// top can coexist with a near-perfect median whenever fewer than half the peaks are affected.
+fn quantiles(sorted: &[f32]) -> [f32; 4] {
+    let at = |f: f64| -> f32 {
+        if sorted.is_empty() { return f32::NAN; }
+        let i = ((sorted.len() - 1) as f64 * f).round() as usize;
+        sorted[i.min(sorted.len() - 1)]
+    };
+    [at(0.10), at(0.50), at(0.90), at(0.99)]
+}
+
+/// The template's own MS1 intensity regime: `(floor, median)`, sampling `sample_scans` MS1 scans
+/// spread across the acquisition.
+///
+/// The Bruker sibling of this is `render.rs::reference_intensity_floor`, and the reasoning is the
+/// same: the reporting floor is a property of the acquisition being replayed. The difference is
+/// that Orbitrap intensity is an ARBITRARY DETECTOR UNIT, so the floor alone is not enough — the
+/// median comes back too, to set the axis the floor is applied on.
+///
+/// Deliberately UNBOUNDED in m/z: any bound can only bias the floor upward by hiding the peak that
+/// actually sets it. FTMS MS1 is stored as a profile, so the signal is read out of the profile
+/// chunks; a centroided template falls back to `centroid_peaks`.
+fn template_level_stats(template: &std::path::Path, level: u8, sample_scans: usize) -> Option<(f32, [f32; 4], usize)> {
+    let rf = thermorawfile::RawFile::open(template).ok()?;
+    let n = rf.scan_count() as u32;
+    if n == 0 {
+        return None;
+    }
+    // Scan numbers for THIS level only. The two levels have genuinely different reporting floors —
+    // measured on a stock Exploris DIA run, MS1 censors at 25,760 and MS2 at 575.5, a factor of 45.
+    // Applying one floor to both censors MS2 ~45x too hard and guts the fragment signal a DIA search
+    // scores on (measured: 0.03x the template's MS2 peaks/scan).
+    let ms1: Vec<u32> = (1..=n)
+        .filter(|&k| rf.scan_event(k).map(|e| e.ms_order == level as u8).unwrap_or(false))
+        .collect();
+    if ms1.is_empty() {
+        return None;
+    }
+    // CENTROIDS FIRST, and the domain is the whole point. A profile scan's stored signal includes
+    // the BASELINE BETWEEN peaks, so its smallest non-zero value is the detector's noise floor —
+    // ~4 orders of magnitude below the smallest peak the instrument actually REPORTS. Inheriting
+    // that baseline as the floor makes the cut ~100x too permissive relative to the median, the dim
+    // tail survives, and the rendered dynamic range blows past the real one by orders of magnitude
+    // (measured: 1.8e13 against the template's 8.8e4). What a search consumes is centroids, and the
+    // render deposits discrete authored peaks rather than a true profile, so the peak-reporting
+    // floor is the one that governs. Profile is the fallback, and it says so.
+    let step = (ms1.len() / sample_scans.max(1)).max(1);
+    let sampled: Vec<u32> = ms1.iter().step_by(step).take(sample_scans).copied().collect();
+
+    // ONE DOMAIN FOR THE WHOLE LEVEL. Deciding per scan and concatenating would mix a profile
+    // BASELINE (the detector noise between peaks) with CENTROID peak heights in a single pool —
+    // they differ by ~4 orders of magnitude, so a handful of fallback scans could set the floor
+    // while centroids set the median, and the resulting "floor" and "median" would not describe the
+    // same quantity. That is the exact defect this function exists to avoid.
+    let n_centroid = sampled.iter().filter(|&&s| !rf.centroid_peaks(s).is_empty()).count();
+    let use_centroids = n_centroid * 2 >= sampled.len();     // majority decides, all scans follow
+    let mut vals: Vec<f32> = Vec::new();
+    for &scan in &sampled {
+        if use_centroids {
+            vals.extend(rf.centroid_peaks(scan).iter().map(|p| p.intensity).filter(|v| *v > 0.0));
+        } else if let Some(prof) = rf.profile(scan) {
+            for ch in &prof.chunks {
+                vals.extend(ch.signal.iter().copied().filter(|v| *v > 0.0));
+            }
+        }
+    }
+    if !use_centroids {
+        eprintln!(
+            "  WARNING: template MS{level} exposes centroids on only {n_centroid}/{} sampled scans, so \
+             the whole level falls back to the PROFILE baseline — well below the instrument's \
+             peak-reporting threshold, and it will under-censor the rendered dim tail. Supply \
+             --min-peak-intensity (and --template-ms1-median for MS1) from a centroid-domain \
+             measurement instead.", sampled.len());
+    } else if n_centroid < sampled.len() {
+        eprintln!(
+            "  note: template MS{level} has centroids on {n_centroid}/{} sampled scans; the \
+             centroid-only scans set the statistics and the rest are skipped, so both numbers stay \
+             in one domain.", sampled.len());
+    }
+    if vals.is_empty() {
+        return None;
+    }
+    vals.sort_unstable_by(|a, b| a.total_cmp(b));
+    Some((vals[0], quantiles(&vals), vals.len()))
 }
 
 fn load_list_spectra(path: &PathBuf, want_level: u8) -> Result<HashMap<u64, Vec<(f64, f32)>>> {
@@ -147,15 +268,43 @@ impl PeakShapeArg {
 }
 
 fn main() -> Result<()> {
-    let a = Args::parse();
+    let mut a = Args::parse();
     // This binary's hand-rolled width checks are what the other three renderers were missing. They
     // now live in one shared validator that all four call, so the rules cannot drift apart again.
     timsim_cli::render::validate_elution_widths("sigma-seconds", a.sigma_seconds, a.n_sigma)?;
     if !(a.gradient_trim.is_finite() && (0.0..0.5).contains(&a.gradient_trim)) {
         return Err(anyhow!("--gradient-trim must be in [0, 0.5)"));
     }
-    if !(a.intensity_scale.is_finite() && a.intensity_scale > 0.0) {
-        return Err(anyhow!("--intensity-scale must be finite and > 0"));
+    // 0 is the CALIBRATE sentinel (resolved against the template below), so the guard rejects only
+    // non-finite and negative values.
+    if !(a.intensity_scale.is_finite() && a.intensity_scale >= 0.0) {
+        return Err(anyhow!("--intensity-scale must be finite and >= 0 (0 = calibrate from the template)"));
+    }
+    if !(a.min_peak_intensity.is_finite() && a.min_peak_intensity >= 0.0) {
+        return Err(anyhow!("--min-peak-intensity must be finite and >= 0 (0 = inherit the template's floor)"));
+    }
+    if !(a.min_peak_intensity_ms2.is_finite() && a.min_peak_intensity_ms2 >= 0.0) {
+        return Err(anyhow!("--min-peak-intensity-ms2 must be finite and >= 0 (0 = inherit the template's MS2 floor)"));
+    }
+    if !(a.template_ms1_median.is_finite() && a.template_ms1_median >= 0.0) {
+        return Err(anyhow!("--template-ms1-median must be finite and >= 0 (0 = measure it from the template)"));
+    }
+    // A supplied target BELOW the floor has no solution: no scale makes the median of the surviving
+    // peaks equal a value the floor itself censors. Catch it here rather than letting the solver
+    // converge onto an empty survivor set and report a one-element "distribution".
+    if a.template_ms1_median > 0.0 && a.min_peak_intensity > 0.0
+        && a.template_ms1_median < a.min_peak_intensity {
+        return Err(anyhow!(
+            "--template-ms1-median {:.4e} is below --min-peak-intensity {:.4e}: the floor censors the \
+             target, so no scale satisfies it. The two must come from the SAME domain.",
+            a.template_ms1_median, a.min_peak_intensity));
+    }
+    // EARLY, before the template parse and the input loads: asking to calibrate while pinning the
+    // scale is a contradiction, and discovering it after minutes of work helps nobody.
+    if a.calibrate_only && a.intensity_scale > 0.0 {
+        return Err(anyhow!(
+            "--calibrate-only was passed together with an explicit --intensity-scale {:.4e}, so there \
+             is nothing to calibrate. Drop --intensity-scale (or set it to 0).", a.intensity_scale));
     }
 
     // peptide_id -> rt_index, and the artifact's fixed reference range (stamped over the whole space).
@@ -328,7 +477,208 @@ fn main() -> Result<()> {
     let (hleft, hright) = timsim_cli::render::elution_half_widths(a.sigma_seconds, a.n_sigma, &shape);
     let mut order: Vec<usize> = (0..precs.len()).collect();
     order.sort_by(|&x, &y| precs[x].apex_rt.total_cmp(&precs[y].apex_rt)); // total_cmp: NaN-safe (guarded finite above)
+
+    // Inherit the template's intensity regime, for the same reason `timsim-render` inherits the
+    // reference `.d`'s reporting floor: both are properties of the acquisition being replayed.
+    // Orbitrap intensity is an arbitrary detector unit, so BOTH numbers are needed — a floor without
+    // the matching scale would censor the whole render (the Bruker constant put the authored median
+    // four orders of magnitude below the template's own floor).
+    let need_measure = (a.intensity_scale <= 0.0 && a.template_ms1_median <= 0.0)
+        || a.min_peak_intensity <= 0.0;
+    let measured = if need_measure { template_level_stats(&a.template, 1, 24) } else { None };
+    let tquants = measured.map(|(_, q, _)| q);
+    // An explicitly supplied median overrides the measured one, and both are reported so a run's log
+    // always states which domain the calibration was done in.
+    let tstats: Option<(f32, f32)> = match (measured, a.template_ms1_median > 0.0) {
+        (m, true) => Some((m.map(|(f, _, _)| f).unwrap_or(0.0), a.template_ms1_median as f32)),
+        (Some((f, q, _)), false) => Some((f, q[1])),
+        (None, false) => None,
+    };
+    if a.template_ms1_median > 0.0 {
+        eprintln!("  template MS1 median = {:.4e} (supplied, not measured)", a.template_ms1_median);
+    }
+    // FLOOR FIRST: the scale is calibrated against the population that SURVIVES the floor, so the
+    // floor has to be known before the scale can be.
+    if a.min_peak_intensity <= 0.0 {
+        a.min_peak_intensity = match tstats {
+            Some((tfloor, _)) => {
+                eprintln!("  min_peak_intensity = {tfloor:.4e} (inherited from the template's own floor)");
+                tfloor as f64
+            }
+            None => {
+                eprintln!("  min_peak_intensity = 1 (template floor unreadable; keeps every non-zero peak)");
+                1.0
+            }
+        };
+    }
+    if a.min_peak_intensity_ms2 <= 0.0 {
+        a.min_peak_intensity_ms2 = match template_level_stats(&a.template, 2, 24) {
+            Some((f2, _, _)) => {
+                eprintln!("  min_peak_intensity (MS2) = {f2:.4e} (inherited from the template's own MS2 floor)");
+                f2 as f64
+            }
+            None => {
+                // Falling back to the MS1 floor is the WRONG default (it over-censors), so fall back
+                // to keeping everything and say why.
+                eprintln!("  min_peak_intensity (MS2) = 1 (template MS2 floor unreadable; NOT reusing \
+                           the MS1 floor, which would over-censor fragments)");
+                1.0
+            }
+        };
+    }
+    if a.intensity_scale <= 0.0 {
+        match tstats {
+            Some((_, tmedian)) => {
+                // What the sweep is about to author, WITHOUT any scale: the same active-set walk as
+                // the real pass, recording only on every `CAL_STRIDE`-th MS1 slot.
+                const CAL_STRIDE: usize = 32;
+                let (mut cur, mut act, mut vals) = (0usize, Vec::<usize>::new(), Vec::<f32>::new());
+                for (si, (&(_s, lvl, _p), &(t, _iso))) in manifest.iter().zip(schedule.iter()).enumerate() {
+                    while cur < order.len() && precs[order[cur]].apex_rt - hleft <= t { act.push(order[cur]); cur += 1; }
+                    act.retain(|&i| precs[i].apex_rt + hright >= t);
+                    if lvl != 1 || si % CAL_STRIDE != 0 { continue; }
+                    for &i in &act {
+                        let p = &precs[i];
+                        let w = timsim_cli::render::elution_ordinate(t, p.apex_rt, a.sigma_seconds, &shape);
+                        if w <= 1e-6 { continue; }
+                        let base = p.abundance * w;
+                        for &(_m, iv) in &p.ms1 { vals.push((base * iv as f64) as f32); }
+                    }
+                }
+                vals.retain(|v| *v > 0.0);
+                if vals.is_empty() {
+                    return Err(anyhow!(
+                        "--intensity-scale 0 (calibrate) but the sweep authored no MS1 signal to calibrate \
+                         against; pass an explicit positive --intensity-scale"));
+                }
+                vals.sort_unstable_by(|x, y| x.total_cmp(y));
+
+                // STATE THE DENOMINATOR. `tmedian` is the median of peaks the template actually
+                // WROTE — already above its own reporting floor. The naive ratio
+                // `tmedian / median(vals)` compares that against a median taken over EVERY authored
+                // peak, including the dim ones this floor is about to delete, which drags the
+                // authored median down and biases the scale UP. The two medians have to be over the
+                // same population: peaks that survive.
+                //
+                // Surviving under scale `s` is `v * s >= floor`, i.e. `v >= floor / s` — and since
+                // `vals` is sorted that set is a SUFFIX, so each iteration is a binary search plus
+                // an index. Solve `s * median(vals[i(s)..]) == tmedian` by fixed point; it converges
+                // in a handful of steps because raising `s` only ever admits more (dimmer) peaks,
+                // which lowers the surviving median monotonically.
+                let floor_v = a.min_peak_intensity as f32;
+                let median_from = |i: usize| vals[i + (vals.len() - i) / 2];
+                let surviving_lo = |s: f64| -> usize {
+                    let cut = (floor_v as f64 / s) as f32;
+                    vals.partition_point(|v| *v < cut)
+                };
+                let mut s = (tmedian / median_from(0)) as f64;   // seed: the naive, biased ratio
+                let (mut lo, mut iters, mut converged) = (surviving_lo(s), 0u32, false);
+                for _ in 0..64 {
+                    iters += 1;
+                    if lo >= vals.len() {
+                        return Err(anyhow!(
+                            "--intensity-scale 0 (calibrate): the floor {:.4e} censors every authored \
+                             MS1 peak, so no scale reproduces the target median. Either the template is \
+                             not the acquisition this sample belongs to, or the floor and the median \
+                             came from different domains.", floor_v));
+                    }
+                    let next = (tmedian / median_from(lo)) as f64;
+                    converged = ((next - s) / s).abs() < 1e-4;
+                    s = next;
+                    lo = surviving_lo(s);
+                    if converged { break; }
+                }
+                // The loop tests `lo` at the TOP, so the value produced by the LAST assignment has
+                // never been checked. If it censors everything, clamping it (as this used to) would
+                // report a one-element "survivor distribution" and a meaningless residual while the
+                // authoring pass went on to emit nothing.
+                if lo >= vals.len() {
+                    return Err(anyhow!(
+                        "--intensity-scale 0 (calibrate): the solver settled on scale {s:.4e}, at which \
+                         the floor {floor_v:.4e} censors every authored MS1 peak. No usable axis exists \
+                         for this (template, sample) pair."));
+                }
+                a.intensity_scale = s;
+                let kept = vals.len() - lo.min(vals.len());
+                let frac = kept as f64 / vals.len() as f64;
+                let surv_median = median_from(lo.min(vals.len() - 1));
+                // Post-solve residual. The equation is PIECEWISE — the survivor set jumps
+                // discontinuously at `s = floor / v_i` — so an exact root need not exist and the
+                // iteration can stop on tolerance rather than on a solution. Reporting
+                // |log(achieved/target)| makes that visible instead of letting the solver always
+                // return "a" scalar and conceal a model mismatch.
+                let residual = ((s * surv_median as f64) / tmedian as f64).ln().abs();
+                let surv_q = quantiles(&vals[lo.min(vals.len().saturating_sub(1))..]);
+                eprintln!(
+                    "  intensity_scale = {:.4e} ({} in {iters} steps; survivors {kept}/{} = {:.1}%; \
+                     log-residual {:.3e}; floor {:.4e})",
+                    a.intensity_scale, if converged { "converged" } else { "STOPPED AT THE ITERATION CAP" },
+                    vals.len(), frac * 100.0, residual, floor_v);
+                if !converged {
+                    eprintln!(
+                        "  WARNING: the fixed point did not converge in {iters} iterations. The map is \
+                         piecewise — the survivor set jumps at each `floor/s` — so it can cycle across a \
+                         threshold instead of settling. The scale below is the last iterate, not a root.");
+                }
+                if residual > 0.05 {
+                    eprintln!(
+                        "  WARNING: calibration did not land on its target (log-residual {:.3e}); the \
+                         survivor set is discontinuous in the scale, so no exact solution may exist \
+                         here. Treat the axis as approximate.", residual);
+                }
+                if frac < 0.02 || frac > 0.98 {
+                    eprintln!(
+                        "  WARNING: the floor censors {:.1}% of authored peaks — a degenerate \
+                         censoring regime. Either the floor and the median came from DIFFERENT \
+                         domains (a profile baseline paired with a centroid median, or the reverse), \
+                         or this template is not the acquisition this sample belongs to.",
+                        (1.0 - frac) * 100.0);
+                }
+                // ACCEPTANCE TEST, reported and not enforced. Matching a median proves the location
+                // is right and nothing else; the upper quantiles are where the signal-spreading
+                // defect lives. These WARN rather than fail because that defect is known and open —
+                // a fail-closed gate here would block every render and produce nothing.
+                if tquants.is_none() {
+                    eprintln!(
+                        "  acceptance: SKIPPED. The template median was supplied rather than measured, \
+                         so this renderer does not know which domain it is in and cannot build a \
+                         like-for-like quantile table. Run the external centroid-domain probe against \
+                         the rendered output and the template — that comparison is the authority for \
+                         a pure-profile template.");
+                }
+                if let Some(tq) = tquants {
+                    let names = ["p10", "p50", "p90", "p99"];
+                    eprintln!("  acceptance (authored*scale vs template, same domain):");
+                    for i in 0..4 {
+                        let got = surv_q[i] as f64 * s;
+                        let want = tq[i] as f64;
+                        let ratio = if want > 0.0 { got / want } else { f64::NAN };
+                        let flag = if ratio.is_finite() && (0.2..5.0).contains(&ratio) { "ok" } else { "OFF" };
+                        eprintln!("    {:>3}  {:.4e} vs {:.4e}  = {:.3}x  [{}]", names[i], got, want, ratio, flag);
+                    }
+                }
+                if a.calibrate_only {
+                    println!(
+                        "{{\"template\":{:?},\"intensity_scale\":{:.6e},\"min_peak_intensity\":{:.6e},\
+                         \"survivor_fraction\":{:.6},\"iterations\":{},\"log_residual\":{:.6e},\
+                         \"template_median\":{:.6e},\"sampled_peaks\":{}}}",
+                        a.template.display().to_string(), a.intensity_scale, a.min_peak_intensity,
+                        frac, iters, residual, tmedian, vals.len());
+                    eprintln!("  --calibrate-only: exiting before authoring. Freeze intensity_scale \
+                               and min_peak_intensity into the job config so every arm shares one axis.");
+                    return Ok(());
+                }
+            }
+            None => {
+                return Err(anyhow!(
+                    "--intensity-scale 0 (calibrate) but the template {} could not be read for its \
+                     MS1 intensity regime; pass an explicit positive --intensity-scale",
+                    a.template.display()));
+            }
+        }
+    }
     let floor = a.min_peak_intensity as f32;
+    let floor_ms2 = a.min_peak_intensity_ms2 as f32;
 
     // The .raw peak count is a u32 on disk, but the thermorawfile author_centroids/author_profile
     // functions currently guard at u16::MAX (65_535) and also must fit the template scan's existing
@@ -372,7 +722,7 @@ fn main() -> Result<()> {
                 let base = p.abundance * ew * tprob * a.intensity_scale;
                 for &(m, iv) in &p.ms2 {
                     let v = (base * iv as f64) as f32;
-                    if v >= floor { peaks.push((m, v)); }
+                    if v >= floor_ms2 { peaks.push((m, v)); }
                 }
             }
         }
