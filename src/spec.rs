@@ -269,6 +269,24 @@ pub struct VarianceSpec {
     /// in the measurement.
     #[serde(default)]
     pub technical: f64,
+    /// Per-protein MULTIPLIERS on the drawn CV, keyed by protein id:
+    ///
+    /// ```toml
+    /// [variance.cv_multipliers]
+    /// P00751 = 0.78   # CFB — complement, the tightest class in real plasma
+    /// ```
+    ///
+    /// A multiplier rather than an absolute CV on purpose: measured class variability comes from
+    /// SEARCHED data and carries measurement noise, which the renderer adds again downstream, so an
+    /// absolute value would author it twice. A ratio between classes measured the same way cancels
+    /// most of that, and what it does not cancel is conservative — noise compresses observed ratios
+    /// toward 1, understating the true spread.
+    ///
+    /// Distinct from `biological_heterogeneity`, which draws every protein's CV at random: that
+    /// gives a distribution of the right WIDTH assigned by dice. Use this where the class is
+    /// actually known.
+    #[serde(default)]
+    pub cv_multipliers: std::collections::HashMap<String, f64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -363,6 +381,7 @@ pub fn load_design(path: &Path, abundance_dir: &Path) -> Result<design::DesignSp
             biological: f.variance.biological,
             biological_heterogeneity: f.variance.biological_heterogeneity,
             technical: f.variance.technical,
+            cv_multipliers: f.variance.cv_multipliers.clone(),
         },
         seed: f.design.seed,
     })
